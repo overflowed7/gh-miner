@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+#
+# gh-harvest — collecte et dump d'objets git pour la recherche de secrets
+#
+# Remplace harvest-git + git-dump. Différences avec l'ancien couple :
+#   - récupère refs/pull/*/head (PR fermées, branches supprimées, force-push)
+#   - écrit les dumps HORS des arbres de travail
+#   - isole les blobs inaccessibles depuis toute ref (le sous-ensemble utile)
+#   - un seul processus git pour tous les objets au lieu d'un fork par objet
+#
+# Dépendances : git. Optionnelles : gh (listing d'org), trufflehog ou docker.
+
+set -uo pipefail
+
+VERSION="1.0"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------- defaults ---
+
+ORG=""
+REPOS=()
+BASE=""
+HOST="github.com"
+JOBS=1
+WITH_PR=1
+DO_DUMP=0
+ORPHANS_ONLY=0
+DO_SCAN=0
+LIST_ONLY=0
+WITH_FORKS=0
+EXCLUDE_DETECTORS="lob"
+LIMIT=500
+QUIET=0
+WORKER_REPO=""
+
+# ------------------------------------------------------------------- help ---
+
+usage() {
+    cat <<'EOF'
+gh-harvest — collecte git orientée recherche de secrets
+
+USAGE
+    gh-harvest -o <org> [options]
+    gh-harvest -o <org> -r <repo> [-r <repo> ...] [options]
+    gh-harvest -o <org> -l
+
+CIBLE
+    -o, --org <org>        organisation ou utilisateur GitHub          (requis)
+    -r, --repo <repo>      un dépôt précis. Répétable. Sans ce drapeau,
+                           tous les dépôts non forkés de l'org sont pris.
+    -F, --forks            inclure les forks dans le listing d'org
+    -L, --limit <n>        nombre max de dépôts listés          (défaut: 500)
+    -H, --host <host>      hôte git                       (défaut: github.com)
+
+ACTIONS
+    -l, --list             lister les dépôts et sortir (aucun clone)
+    -D, --dump             extraire tous les blobs vers objects/<repo>/
+    -O, --orphans          extraire UNIQUEMENT les blobs orphelins
+                           (inaccessibles depuis toute ref) — implique -D
+    -s, --scan             lancer trufflehog sur chaque dépôt
+
+OPTIONS
+    -d, --dir <chemin>     racine de travail     (défaut: ~/work/targets/<org>)
+    -j, --jobs <n>         dépôts traités en parallèle              (défaut: 1)
+    -n, --no-pr            ne pas récupérer refs/pull/* (déconseillé)
+    -x, --exclude <liste>  détecteurs trufflehog à exclure       (défaut: lob)
+    -q, --quiet            sortie minimale
+    -h, --help             cette aide
+    -V, --version          version
+
+ARBORESCENCE PRODUITE
+    <base>/
+      repos/<repo>/                dépôt cloné, branches pr/* incluses
+      objects/<repo>/              blobs extraits (un fichier par SHA)
+      objects/<repo>.orphans.txt   SHA des blobs inaccessibles
+      reports/th-<repo>.json       sortie trufflehog
+      reports/stats.tsv            objets avant/après, branches pr, orphelins
+
+EXEMPLES
+    # reconnaissance : que contient l'org ?
+    gh-harvest -o robinhood -l
+
+    # collecte complète + dump + scan, 4 dépôts en parallèle
+    gh-harvest -o robinhood -D -s -j 4
+
+    # seulement ce qui a été retiré de l'historique (meilleur rendement)
+    gh-harvest -o robinhood -O -s
+
+    # un dépôt précis, dump complet
+    gh-harvest -o robinhood -r faust -D
+
+NOTES
+    Le drapeau -O est le plus rentable : il ne garde que les blobs qui
+    n'appartiennent à aucune branche ni tag ni PR, c'est-à-dire ce que
+    quelqu'un a volontairement retiré de l'historique.
+
+    Le refspec utilisé est '+refs/pull/*/head:refs/heads/pr/*' : les refs de
+    pull requests deviennent des branches LOCALES. C'est nécessaire parce que
+    trufflehog re-clone le dépôt en interne, et qu'un clone abandonne tout ce
+    qui est sous refs/remotes/.
+
+    Le détecteur Lob de trufflehog est exclu par défaut : il matche
+    'test_' + 35 caractères, donc tout nom de fonction pytest de 40
+    caractères, et sa vérification renvoie un succès sur n'importe quoi.
+EOF
+}
+
+# ------------------------------------------------------------------- utils ---
+
+log() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*" >&2; }
+warn() { printf 'attention: %s\n' "$*" >&2; }
+die() {
+    printf 'erreur: %s\n' "$*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "commande absente: $1"
+}
+
+# --------------------------------------------------------------- arguments ---
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -o | --org)
+        ORG="${2:?valeur manquante pour $1}"
+        shift 2
+        ;;
+    -r | --repo)
+        REPOS+=("${2:?valeur manquante pour $1}")
+        shift 2
+        ;;
+    -d | --dir)
+        BASE="${2:?valeur manquante pour $1}"
+        shift 2
+        ;;
+    -H | --host)
+        HOST="${2:?valeur manquante pour $1}"
+        shift 2
+        ;;
+    -j | --jobs)
+        JOBS="${2:?valeur manquante pour $1}"
+        shift 2
+        ;;
+    -L | --limit)
+        LIMIT="${2:?valeur manquante pour $1}"
+        shift 2
+        ;;
+    -x | --exclude)
+        EXCLUDE_DETECTORS="${2:?valeur manquante pour $1}"
+        shift 2
+        ;;
+    -l | --list)
+        LIST_ONLY=1
+        shift
+        ;;
+    -D | --dump)
+        DO_DUMP=1
+        shift
+        ;;
+    -O | --orphans)
+        ORPHANS_ONLY=1
+        DO_DUMP=1
+        shift
+        ;;
+    -s | --scan)
+        DO_SCAN=1
+        shift
+        ;;
+    -F | --forks)
+        WITH_FORKS=1
+        shift
+        ;;
+    -n | --no-pr)
+        WITH_PR=0
+        shift
+        ;;
+    -q | --quiet)
+        QUIET=1
+        shift
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    -V | --version)
+        printf 'gh-harvest %s\n' "$VERSION"
+        exit 0
+        ;;
+    --_worker)
+        WORKER_REPO="${2:?}"
+        shift 2
+        ;; # interne (parallèle)
+    --)
+        shift
+        break
+        ;;
+    -*) die "option inconnue: $1 (voir --help)" ;;
+    *)
+        REPOS+=("$1")
+        shift
+        ;;
+    esac
+done
+
+[ -n "$ORG" ] || {
+    usage >&2
+    die "option -o/--org requise"
+}
+need git
+
+[ -n "$BASE" ] || BASE="$HOME/work/targets/$ORG"
+REPO_DIR="$BASE/repos"
+OBJ_DIR="$BASE/objects"
+REP_DIR="$BASE/reports"
+STAT_DIR="$BASE/.stats"
+
+case "$JOBS" in '' | *[!0-9]*) die "-j attend un entier" ;; esac
+[ "$JOBS" -ge 1 ] || JOBS=1
+
+# --------------------------------------------------------- listing des dépôts ---
+
+list_repos() {
+    if [ "${#REPOS[@]}" -gt 0 ]; then
+        printf '%s\n' "${REPOS[@]}"
+        return
+    fi
+    command -v gh >/dev/null 2>&1 ||
+        die "gh absent : fournis les dépôts avec -r, ou installe gh"
+
+    # un GITHUB_TOKEN invalide dans l'environnement fait échouer gh en 401
+    # alors que 'gh auth' est correctement configuré par ailleurs.
+    local jqf='.[] | .name'
+    [ "$WITH_FORKS" -eq 1 ] || jqf='.[] | select(.isFork==false) | .name'
+
+    env -u GITHUB_TOKEN gh repo list "$ORG" \
+        --limit "$LIMIT" --json name,isFork --jq "$jqf" ||
+        die "gh repo list a échoué pour '$ORG'"
+}
+
+# ------------------------------------------------------- traitement d'un dépôt ---
+
+count_objects() {
+    git -C "$1" count-objects -v 2>/dev/null |
+        awk '/^in-pack:/ {p=$2} /^count:/ {c=$2} END {print c+p}'
+}
+
+clone_or_update() {
+    local repo="$1" dst="$REPO_DIR/$1"
+    if [ -d "$dst/.git" ]; then
+        git -C "$dst" fetch -q --all --prune 2>/dev/null
+    else
+        git clone -q "https://$HOST/$ORG/$repo" "$dst" || return 1
+    fi
+}
+
+fetch_pr_refs() {
+    local dst="$REPO_DIR/$1"
+    # Destination refs/heads/ et non refs/remotes/ : un clone ultérieur
+    # (celui que trufflehog fait en interne) ne recopie que refs/heads et
+    # refs/tags. Une ref rangée sous refs/remotes serait perdue.
+    git -C "$dst" fetch -q origin '+refs/pull/*/head:refs/heads/pr/*' 2>/dev/null
+    # tout le reste (notes, refs internes), sans écraser les branches
+    git -C "$dst" fetch -q origin '+refs/*:refs/remotes/origin/all/*' 2>/dev/null
+    return 0
+}
+
+count_pr_branches() {
+    git -C "$REPO_DIR/$1" for-each-ref --format='%(refname)' refs/heads/pr/ \
+        2>/dev/null | wc -l | tr -d ' '
+}
+
+# Liste les blobs orphelins : présents dans la base, inaccessibles depuis
+# toute ref (branches, tags, pr/*). C'est ce qu'on a voulu effacer.
+find_orphans() {
+    local dst="$REPO_DIR/$1" out="$OBJ_DIR/$1.orphans.txt"
+    comm -23 \
+        <(git -C "$dst" cat-file --batch-all-objects \
+            --batch-check='%(objectname) %(objecttype)' 2>/dev/null |
+            awk '$2=="blob" {print $1}' | sort) \
+        <(git -C "$dst" rev-list --objects --all 2>/dev/null |
+            cut -d' ' -f1 | sort -u) \
+        >"$out"
+    wc -l <"$out" | tr -d ' '
+}
+
+dump_blobs() {
+    local repo="$1" dst="$REPO_DIR/$1" out="$OBJ_DIR/$1"
+    mkdir -p "$out"
+
+    if [ "$ORPHANS_ONLY" -eq 1 ]; then
+        [ -s "$OBJ_DIR/$repo.orphans.txt" ] || {
+            echo 0
+            return
+        }
+        # --batch lit les SHA sur stdin : un seul processus git pour tout.
+        while read -r sha; do
+            git -C "$dst" cat-file blob "$sha" >"$out/$sha" 2>/dev/null ||
+                rm -f "$out/$sha"
+        done <"$OBJ_DIR/$repo.orphans.txt"
+    else
+        git -C "$dst" cat-file --batch-all-objects \
+            --batch-check='%(objectname) %(objecttype)' 2>/dev/null |
+            awk '$2=="blob" {print $1}' |
+            while read -r sha; do
+                git -C "$dst" cat-file blob "$sha" >"$out/$sha" 2>/dev/null ||
+                    rm -f "$out/$sha"
+            done
+    fi
+    find "$out" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+scan_repo() {
+    local repo="$1" dst="$REPO_DIR/$1" rep="$REP_DIR/th-$1.json"
+    local args=(git "file://$dst" --only-verified --no-update --json)
+    [ -n "$EXCLUDE_DETECTORS" ] && args+=(--exclude-detectors="$EXCLUDE_DETECTORS")
+
+    if command -v trufflehog >/dev/null 2>&1; then
+        trufflehog "${args[@]}" >"$rep" 2>/dev/null
+    elif command -v docker >/dev/null 2>&1; then
+        local dargs=(git "file:///repo" --only-verified --no-update --json)
+        [ -n "$EXCLUDE_DETECTORS" ] && dargs+=(--exclude-detectors="$EXCLUDE_DETECTORS")
+        docker run --rm -v "$dst:/repo" \
+            trufflesecurity/trufflehog:latest "${dargs[@]}" >"$rep" 2>/dev/null
+    else
+        warn "ni trufflehog ni docker : scan ignoré pour $repo"
+        return 0
+    fi
+
+    # compte les détections réelles (les lignes de log n'ont pas de DetectorName)
+    local n
+    n="$(grep -c '"DetectorName"' "$rep" 2>/dev/null)"
+    printf '%s\n' "${n:-0}"
+}
+
+process_repo() {
+    local repo="$1"
+    local before=0 after=0 prs=0 orph=- blobs=- hits=-
+
+    log "=== $repo ==="
+    mkdir -p "$REPO_DIR" "$OBJ_DIR" "$REP_DIR" "$STAT_DIR"
+
+    clone_or_update "$repo" || {
+        warn "clone échoué: $repo"
+        return 1
+    }
+    before="$(count_objects "$REPO_DIR/$repo")"
+
+    if [ "$WITH_PR" -eq 1 ]; then
+        fetch_pr_refs "$repo"
+        prs="$(count_pr_branches "$repo")"
+    fi
+    after="$(count_objects "$REPO_DIR/$repo")"
+
+    if [ "$DO_DUMP" -eq 1 ] || [ "$ORPHANS_ONLY" -eq 1 ]; then
+        orph="$(find_orphans "$repo")"
+    fi
+    [ "$DO_DUMP" -eq 1 ] && blobs="$(dump_blobs "$repo")"
+    [ "$DO_SCAN" -eq 1 ] && hits="$(scan_repo "$repo")"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$repo" "$before" "$after" "$prs" "$orph" "$blobs" "$hits" \
+        >"$STAT_DIR/$repo.tsv"
+
+    log "  objets $before -> $after | branches pr: $prs | orphelins: $orph | blobs: $blobs | detections: $hits"
+}
+
+# ------------------------------------------------------------------- worker ---
+
+if [ -n "$WORKER_REPO" ]; then
+    process_repo "$WORKER_REPO"
+    exit $?
+fi
+
+# --------------------------------------------------------------------- main ---
+
+mapfile -t ALL_REPOS < <(list_repos)
+[ "${#ALL_REPOS[@]}" -gt 0 ] || die "aucun dépôt trouvé"
+
+if [ "$LIST_ONLY" -eq 1 ]; then
+    printf '%s\n' "${ALL_REPOS[@]}"
+    exit 0
+fi
+
+log "cible : $ORG (${#ALL_REPOS[@]} dépôts) -> $BASE"
+mkdir -p "$REPO_DIR" "$OBJ_DIR" "$REP_DIR" "$STAT_DIR"
+rm -f "$STAT_DIR"/*.tsv 2>/dev/null
+
+# Reconstruction des drapeaux à transmettre aux workers.
+FLAGS=(-o "$ORG" -d "$BASE" -H "$HOST" -x "$EXCLUDE_DETECTORS")
+[ "$DO_DUMP" -eq 1 ] && FLAGS+=(-D)
+[ "$ORPHANS_ONLY" -eq 1 ] && FLAGS+=(-O)
+[ "$DO_SCAN" -eq 1 ] && FLAGS+=(-s)
+[ "$WITH_PR" -eq 0 ] && FLAGS+=(-n)
+[ "$QUIET" -eq 1 ] && FLAGS+=(-q)
+
+if [ "$JOBS" -gt 1 ]; then
+    # -P n : n processus concurrents. -I{} substitue le dépôt lu sur stdin.
+    printf '%s\n' "${ALL_REPOS[@]}" |
+        xargs -P "$JOBS" -I{} "$SELF" "${FLAGS[@]}" --_worker {}
+else
+    for repo in "${ALL_REPOS[@]}"; do
+        process_repo "$repo"
+    done
+fi
+
+# ------------------------------------------------------------------ rapport ---
+
+STATS="$REP_DIR/stats.tsv"
+{
+    printf 'repo\tavant\tapres\tpr\torphelins\tblobs\tdetections\n'
+    cat "$STAT_DIR"/*.tsv 2>/dev/null | sort
+} >"$STATS"
+
+if [ "$QUIET" -eq 0 ]; then
+    echo
+    column -t -s $'\t' "$STATS" 2>/dev/null || cat "$STATS"
+    echo
+    echo "rapport : $STATS"
+
+    # Les dépôts dont l'écart avant/après est le plus large cachent le plus de
+    # contenu hors branches : c'est là qu'il faut regarder en premier.
+    echo
+    echo "dépôts à regarder en priorité (gain d'objets via refs/pull) :"
+    tail -n +2 "$STATS" |
+        awk -F'\t' '$3>$2 {printf "  %-38s +%-7d (x%.1f)\n", $1, $3-$2, $3/$2}' |
+        sort -t+ -k2 -rn | head -5
+fi
