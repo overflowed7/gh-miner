@@ -67,7 +67,7 @@ gh-harvest -o acme -r api -D     # single repo
 **Other**
 
 ```
--d, --dir <path>       work root (default ~/work/targets/<org>)
+-d, --dir <path>       work root (default ./gh-history)
 -j, --jobs <n>         repos in parallel (default 1)
 -n, --no-pr            skip refs/pull/* (not recommended)
 -x, --exclude <list>   trufflehog detectors to exclude (default: lob)
@@ -78,7 +78,7 @@ gh-harvest -o acme -r api -D     # single repo
 ## Layout
 
 ```
-~/work/targets/<org>/
+./gh-history/
 ├── repos/<repo>/                 clone, with pr/* branches and refs/orphans/*
 ├── objects/<repo>/               extracted blobs, one file per SHA
 ├── objects/<repo>.orphans.txt    SHAs of orphaned commits recovered by SHA fetch
@@ -97,5 +97,5 @@ Dumps live outside the repos, so grepping doesn't hit every object twice and
 Once `-D` has run, point your usual tooling at `objects/`:
 
 ```bash
-cd ~/work/targets/<org>/objects && gf sec | sort -u
+cd gh-history/objects && gf sec | sort -u
 ```

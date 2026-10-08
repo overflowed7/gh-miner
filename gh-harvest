@@ -66,7 +66,7 @@ ACTIONS
     -s, --scan             lancer trufflehog sur chaque dépôt
 
 OPTIONS
-    -d, --dir <chemin>     racine de travail     (défaut: ~/work/targets/<org>)
+    -d, --dir <chemin>     racine de travail      (défaut: ./gh-history)
     -j, --jobs <n>         dépôts traités en parallèle              (défaut: 1)
     -n, --no-pr            ne pas récupérer refs/pull/* (déconseillé)
     -x, --exclude <liste>  détecteurs trufflehog à exclure       (défaut: lob)
@@ -213,7 +213,7 @@ done
 }
 need git
 
-[ -n "$BASE" ] || BASE="$HOME/work/targets/$ORG"
+[ -n "$BASE" ] || BASE="$PWD/gh-history"
 REPO_DIR="$BASE/repos"
 OBJ_DIR="$BASE/objects"
 REP_DIR="$BASE/reports"
