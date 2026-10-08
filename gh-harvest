@@ -2,17 +2,25 @@
 #
 # gh-harvest — collecte et dump d'objets git pour la recherche de secrets
 #
-# Remplace harvest-git + git-dump. Différences avec l'ancien couple :
-#   - récupère refs/pull/*/head (PR fermées, branches supprimées, force-push)
-#   - écrit les dumps HORS des arbres de travail
-#   - isole les blobs inaccessibles depuis toute ref (le sous-ensemble utile)
-#   - un seul processus git pour tous les objets au lieu d'un fork par objet
+# Récupère le maximum d'objets d'un dépôt GitHub, y compris ce qui n'est plus
+# accessible depuis une branche :
+#   - refs/pull/*/head : PR fermées, branches supprimées, force-push référencés
+#   - fetch par SHA (sous -D) : commits ORPHELINS retrouvés via l'API GitHub
+#     (events PushEvent + head/merge des PR). Capte les pushes écrasés et les
+#     PR de forks supprimés que GitHub sert encore par SHA tant qu'ils ne sont
+#     pas GC. Ancrés sous refs/orphans/<sha> pour survivre au GC local.
+#   - dump de tous les blobs hors arbres de travail, un fichier par SHA
 #
-# Dépendances : git. Optionnelles : gh (listing d'org), trufflehog ou docker.
+# Dépendances : git. Recommandées : gh (listing + fetch par SHA), jq.
+#               Optionnelles : trufflehog ou docker (scan -s).
+#
+# Note : un GITHUB_TOKEN invalide dans l'environnement fait échouer gh en 401 ;
+# tous les appels gh passent par 'env -u GITHUB_TOKEN' pour retomber sur l'auth
+# keyring.
 
 set -uo pipefail
 
-VERSION="1.0"
+VERSION="1.1"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # ---------------------------------------------------------------- defaults ---
@@ -24,7 +32,6 @@ HOST="github.com"
 JOBS=1
 WITH_PR=1
 DO_DUMP=0
-ORPHANS_ONLY=0
 DO_SCAN=0
 LIST_ONLY=0
 WITH_FORKS=0
@@ -53,10 +60,9 @@ CIBLE
     -H, --host <host>      hôte git                       (défaut: github.com)
 
 ACTIONS
-    -l, --list             lister les dépôts et sortir (aucun clone)
-    -D, --dump             extraire tous les blobs vers objects/<repo>/
-    -O, --orphans          extraire UNIQUEMENT les blobs orphelins
-                           (inaccessibles depuis toute ref) — implique -D
+    -l, --list             lister les dépôts (nom + taille) et sortir
+    -D, --dump             extraire tous les blobs vers objects/<repo>/,
+                           y compris les commits orphelins retrouvés par SHA
     -s, --scan             lancer trufflehog sur chaque dépôt
 
 OPTIONS
@@ -70,29 +76,29 @@ OPTIONS
 
 ARBORESCENCE PRODUITE
     <base>/
-      repos/<repo>/                dépôt cloné, branches pr/* incluses
+      repos/<repo>/                dépôt cloné, branches pr/* + refs/orphans/*
       objects/<repo>/              blobs extraits (un fichier par SHA)
-      objects/<repo>.orphans.txt   SHA des blobs inaccessibles
+      objects/<repo>.orphans.txt   SHA des commits orphelins retrouvés par fetch
       reports/th-<repo>.json       sortie trufflehog
       reports/stats.tsv            objets avant/après, branches pr, orphelins
 
 EXEMPLES
-    # reconnaissance : que contient l'org ?
+    # reconnaissance : dépôts non forkés + taille approximative
     gh-harvest -o robinhood -l
 
     # collecte complète + dump + scan, 4 dépôts en parallèle
     gh-harvest -o robinhood -D -s -j 4
 
-    # seulement ce qui a été retiré de l'historique (meilleur rendement)
-    gh-harvest -o robinhood -O -s
-
     # un dépôt précis, dump complet
     gh-harvest -o robinhood -r faust -D
 
 NOTES
-    Le drapeau -O est le plus rentable : il ne garde que les blobs qui
-    n'appartiennent à aucune branche ni tag ni PR, c'est-à-dire ce que
-    quelqu'un a volontairement retiré de l'historique.
+    Sous -D, en plus de refs/pull, gh-harvest interroge l'API GitHub (events et
+    pulls) pour retrouver les commits qui n'ont plus aucune ref — force-push et
+    PR de forks supprimés — puis les fetch par SHA et les ancre sous
+    refs/orphans/. Leurs blobs sont alors inclus dans le dump. La colonne
+    'orphelins' du rapport compte ces commits réellement récupérés
+    (0 = rien d'effacé n'a pu être retrouvé par SHA).
 
     Le refspec utilisé est '+refs/pull/*/head:refs/heads/pr/*' : les refs de
     pull requests deviennent des branches LOCALES. C'est nécessaire parce que
@@ -117,6 +123,9 @@ die() {
 need() {
     command -v "$1" >/dev/null 2>&1 || die "commande absente: $1"
 }
+
+# gh via le keyring (ignore un GITHUB_TOKEN d'environnement invalide)
+ghapi() { env -u GITHUB_TOKEN gh "$@"; }
 
 # --------------------------------------------------------------- arguments ---
 
@@ -155,11 +164,6 @@ while [ $# -gt 0 ]; do
         shift
         ;;
     -D | --dump)
-        DO_DUMP=1
-        shift
-        ;;
-    -O | --orphans)
-        ORPHANS_ONLY=1
         DO_DUMP=1
         shift
         ;;
@@ -228,14 +232,40 @@ list_repos() {
     command -v gh >/dev/null 2>&1 ||
         die "gh absent : fournis les dépôts avec -r, ou installe gh"
 
-    # un GITHUB_TOKEN invalide dans l'environnement fait échouer gh en 401
-    # alors que 'gh auth' est correctement configuré par ailleurs.
     local jqf='.[] | .name'
     [ "$WITH_FORKS" -eq 1 ] || jqf='.[] | select(.isFork==false) | .name'
 
-    env -u GITHUB_TOKEN gh repo list "$ORG" \
+    ghapi repo list "$ORG" \
         --limit "$LIMIT" --json name,isFork --jq "$jqf" ||
         die "gh repo list a échoué pour '$ORG'"
+}
+
+# -l : nom + taille approximative (diskUsage de l'API, en Ko).
+list_repos_sized() {
+    if [ "${#REPOS[@]}" -gt 0 ] || ! command -v gh >/dev/null 2>&1; then
+        list_repos
+        return
+    fi
+    local jqf='.[] | select(.isFork==false) | [.name, .diskUsage] | @tsv'
+    [ "$WITH_FORKS" -eq 1 ] && jqf='.[] | [.name, .diskUsage] | @tsv'
+
+    {
+        printf 'repo\ttaille\n'
+        ghapi repo list "$ORG" --limit "$LIMIT" \
+            --json name,isFork,diskUsage --jq "$jqf" 2>/dev/null |
+            sort |
+            awk -F'\t' '
+                function human(kb) {
+                    if (kb>=1048576)   return sprintf("%.1f GB", kb/1048576)
+                    else if (kb>=1024) return sprintf("%.1f MB", kb/1024)
+                    else               return sprintf("%d KB", kb)
+                }
+                { tot+=$2; n++; printf "%s\t%s\n", $1, human($2) }
+                END {
+                    printf "%s\t%s\n", "----", "----"
+                    printf "%s\t%s\n", "TOTAL ("n" repos)", human(tot)
+                }'
+    } | { column -t -s $'\t' 2>/dev/null || cat; }
 }
 
 # ------------------------------------------------------- traitement d'un dépôt ---
@@ -270,43 +300,63 @@ count_pr_branches() {
         2>/dev/null | wc -l | tr -d ' '
 }
 
-# Liste les blobs orphelins : présents dans la base, inaccessibles depuis
-# toute ref (branches, tags, pr/*). C'est ce qu'on a voulu effacer.
-find_orphans() {
-    local dst="$REPO_DIR/$1" out="$OBJ_DIR/$1.orphans.txt"
-    comm -23 \
-        <(git -C "$dst" cat-file --batch-all-objects \
-            --batch-check='%(objectname) %(objecttype)' 2>/dev/null |
-            awk '$2=="blob" {print $1}' | sort) \
-        <(git -C "$dst" rev-list --objects --all 2>/dev/null |
-            cut -d' ' -f1 | sort -u) \
-        >"$out"
-    wc -l <"$out" | tr -d ' '
+# Retrouve les commits ORPHELINS par SHA : ceux qu'aucune ref n'atteint plus
+# (force-push, PR de forks supprimés). Sources de SHA : API events (PushEvent)
+# + head/merge de toutes les PR. Chaque SHA absent du clone est fetché par SHA
+# et ancré sous refs/orphans/<sha> (sinon il serait GC). Imprime sur stdout le
+# nombre de commits récupérés ; détail sur stderr.
+fetch_sha_orphans() {
+    local repo="$1" dst="$REPO_DIR/$1" out="$OBJ_DIR/$1.orphans.txt"
+    : >"$out"
+
+    if ! command -v gh >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        echo 0
+        return
+    fi
+
+    # candidats = events (push: before/head/commits) + pulls (head/merge)
+    local cand
+    cand="$(
+        {
+            ghapi api "repos/$ORG/$repo/events?per_page=100" --paginate 2>/dev/null |
+                jq -r '.[]? | select(.type=="PushEvent") | .payload
+                       | (.before, .head, (.commits[]?.sha))' 2>/dev/null
+            ghapi api "repos/$ORG/$repo/pulls?state=all&per_page=100" --paginate 2>/dev/null |
+                jq -r '.[]? | (.head.sha, .merge_commit_sha) | select(.!=null)' 2>/dev/null
+        } | tr 'A-Z' 'a-z' | grep -oE '^[0-9a-f]{40}$' | grep -vE '^0{40}$' | sort -u
+    )"
+
+    local ncand=0
+    [ -n "$cand" ] && ncand=$(printf '%s\n' "$cand" | grep -c .)
+
+    local n=0 s
+    for s in $cand; do
+        git -C "$dst" cat-file -e "$s" 2>/dev/null && continue
+        if git -C "$dst" fetch --no-tags -q origin "$s" 2>/dev/null &&
+            git -C "$dst" cat-file -e "$s" 2>/dev/null; then
+            git -C "$dst" update-ref "refs/orphans/$s" "$s" 2>/dev/null
+            printf '%s\n' "$s" >>"$out"
+            n=$((n + 1))
+        fi
+    done
+
+    log "  fetch-sha: $ncand candidats -> $n récupéré(s) par SHA"
+    printf '%s\n' "$n"
 }
 
 dump_blobs() {
     local repo="$1" dst="$REPO_DIR/$1" out="$OBJ_DIR/$1"
     mkdir -p "$out"
 
-    if [ "$ORPHANS_ONLY" -eq 1 ]; then
-        [ -s "$OBJ_DIR/$repo.orphans.txt" ] || {
-            echo 0
-            return
-        }
-        # --batch lit les SHA sur stdin : un seul processus git pour tout.
+    # --batch-all-objects : tous les blobs de la base, y compris ceux ramenés
+    # par les refs/pull et le fetch par SHA (refs/orphans).
+    git -C "$dst" cat-file --batch-all-objects \
+        --batch-check='%(objectname) %(objecttype)' 2>/dev/null |
+        awk '$2=="blob" {print $1}' |
         while read -r sha; do
             git -C "$dst" cat-file blob "$sha" >"$out/$sha" 2>/dev/null ||
                 rm -f "$out/$sha"
-        done <"$OBJ_DIR/$repo.orphans.txt"
-    else
-        git -C "$dst" cat-file --batch-all-objects \
-            --batch-check='%(objectname) %(objecttype)' 2>/dev/null |
-            awk '$2=="blob" {print $1}' |
-            while read -r sha; do
-                git -C "$dst" cat-file blob "$sha" >"$out/$sha" 2>/dev/null ||
-                    rm -f "$out/$sha"
-            done
-    fi
+        done
     find "$out" -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
@@ -350,11 +400,14 @@ process_repo() {
         fetch_pr_refs "$repo"
         prs="$(count_pr_branches "$repo")"
     fi
+
+    # Récupération des orphelins par SHA avant le dump, pour que leurs blobs
+    # soient inclus. 'apres' est compté ensuite -> reflète pr + orphelins.
+    if [ "$DO_DUMP" -eq 1 ]; then
+        orph="$(fetch_sha_orphans "$repo")"
+    fi
     after="$(count_objects "$REPO_DIR/$repo")"
 
-    if [ "$DO_DUMP" -eq 1 ] || [ "$ORPHANS_ONLY" -eq 1 ]; then
-        orph="$(find_orphans "$repo")"
-    fi
     [ "$DO_DUMP" -eq 1 ] && blobs="$(dump_blobs "$repo")"
     [ "$DO_SCAN" -eq 1 ] && hits="$(scan_repo "$repo")"
 
@@ -374,13 +427,13 @@ fi
 
 # --------------------------------------------------------------------- main ---
 
-mapfile -t ALL_REPOS < <(list_repos)
-[ "${#ALL_REPOS[@]}" -gt 0 ] || die "aucun dépôt trouvé"
-
 if [ "$LIST_ONLY" -eq 1 ]; then
-    printf '%s\n' "${ALL_REPOS[@]}"
+    list_repos_sized
     exit 0
 fi
+
+mapfile -t ALL_REPOS < <(list_repos)
+[ "${#ALL_REPOS[@]}" -gt 0 ] || die "aucun dépôt trouvé"
 
 log "cible : $ORG (${#ALL_REPOS[@]} dépôts) -> $BASE"
 mkdir -p "$REPO_DIR" "$OBJ_DIR" "$REP_DIR" "$STAT_DIR"
@@ -389,7 +442,6 @@ rm -f "$STAT_DIR"/*.tsv 2>/dev/null
 # Reconstruction des drapeaux à transmettre aux workers.
 FLAGS=(-o "$ORG" -d "$BASE" -H "$HOST" -x "$EXCLUDE_DETECTORS")
 [ "$DO_DUMP" -eq 1 ] && FLAGS+=(-D)
-[ "$ORPHANS_ONLY" -eq 1 ] && FLAGS+=(-O)
 [ "$DO_SCAN" -eq 1 ] && FLAGS+=(-s)
 [ "$WITH_PR" -eq 0 ] && FLAGS+=(-n)
 [ "$QUIET" -eq 1 ] && FLAGS+=(-q)
@@ -421,7 +473,7 @@ if [ "$QUIET" -eq 0 ]; then
     # Les dépôts dont l'écart avant/après est le plus large cachent le plus de
     # contenu hors branches : c'est là qu'il faut regarder en premier.
     echo
-    echo "dépôts à regarder en priorité (gain d'objets via refs/pull) :"
+    echo "dépôts à regarder en priorité (gain d'objets via refs/pull + SHA) :"
     tail -n +2 "$STATS" |
         awk -F'\t' '$3>$2 {printf "  %-38s +%-7d (x%.1f)\n", $1, $3-$2, $3/$2}' |
         sort -t+ -k2 -rn | head -5
