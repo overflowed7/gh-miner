@@ -1,0 +1,531 @@
+#!/usr/bin/env bash
+#
+# gh-miner — git object collection and dump for secret hunting
+#
+# Pulls the maximum number of objects from a GitHub repository, including what
+# is no longer reachable from any branch:
+#   - refs/pull/*/head: closed PRs, deleted branches, referenced force-pushes
+#   - fetch by SHA (under -D): ORPHANED commits recovered via the GitHub API
+#     (PushEvent events + PR head/merge). Captures overwritten pushes and PRs
+#     from deleted forks that GitHub still serves by SHA as long as they are
+#     not GC'd. Anchored under refs/orphans/<sha> to survive local GC.
+#   - dump of every blob outside the working trees, one file per SHA
+#
+# Dependencies: git. Recommended: gh (listing + fetch by SHA), jq.
+#               Optional: trufflehog or docker (scan -s).
+#
+# Note: an invalid GITHUB_TOKEN in the environment makes gh fail with 401;
+# every gh call goes through 'env -u GITHUB_TOKEN' to fall back on keyring auth.
+
+set -uo pipefail
+
+VERSION="1.1"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------- defaults ---
+
+ORG=""
+REPOS=()
+BASE=""
+HOST="github.com"
+JOBS=1
+WITH_PR=1
+DO_DUMP=0
+ORPHANS_ONLY=0
+DO_SCAN=0
+FS_CAND=0
+FS_REC=0
+LIST_ONLY=0
+WITH_FORKS=0
+EXCLUDE_DETECTORS="lob"
+LIMIT=500
+QUIET=0
+WORKER_REPO=""
+
+# ------------------------------------------------------------------- help ---
+
+usage() {
+    cat <<'EOF'
+gh-miner — git collection for secret hunting
+
+USAGE
+    gh-miner -o <org> [options]
+    gh-miner -o <org> -r <repo> [-r <repo> ...] [options]
+    gh-miner -o <org> -l
+
+TARGET
+    -o, --org <org>        GitHub organization or user               (required)
+    -r, --repo <repo>      a specific repo. Repeatable. Without this flag,
+                           all non-forked repos of the org are taken.
+    -F, --forks            include forks in the org listing
+    -L, --limit <n>        max number of repos listed            (default: 500)
+    -H, --host <host>      git host                        (default: github.com)
+
+ACTIONS
+    -l, --list             list repos (name + size) and exit
+    -D, --dump             extract all blobs to objects/<repo>/,
+                           including orphaned commits recovered by SHA
+    -O, --orphans-only     recover orphans by SHA and dump ONLY their
+                           blobs (erased subset, lightweight dump)
+    -s, --scan             run trufflehog on each repo
+
+OPTIONS
+    -d, --dir <path>       work root              (default: ./gh-history)
+    -j, --jobs <n>         repos processed in parallel              (default: 1)
+    -n, --no-pr            do not fetch refs/pull/* (not recommended)
+    -x, --exclude <list>   trufflehog detectors to exclude       (default: lob)
+    -q, --quiet            minimal output
+    -h, --help             this help
+    -V, --version          version
+
+OUTPUT TREE
+    <base>/
+      repos/<repo>/                cloned repo, pr/* branches + refs/orphans/*
+      objects/<repo>/              extracted blobs (one file per SHA)
+      objects/<repo>.orphans.txt   SHAs of orphaned commits recovered by fetch
+      reports/th-<repo>.json       trufflehog output
+      reports/stats.tsv            objects before/after, pr branches, orphans
+
+EXAMPLES
+    # recon: non-forked repos + approximate size
+    gh-miner -o robinhood -l
+
+    # full collection + dump + scan, 4 repos in parallel
+    gh-miner -o robinhood -D -s -j 4
+
+    # a specific repo, full dump
+    gh-miner -o robinhood -r faust -D
+
+NOTES
+    Under -D, in addition to refs/pull, gh-miner queries the GitHub API (events
+    and pulls) to recover commits that no longer have any ref — force-pushes and
+    PRs from deleted forks — then fetches them by SHA and anchors them under
+    refs/orphans/. Their blobs are then included in the dump. The 'orphans'
+    column of the report counts the commits actually recovered
+    (0 = nothing erased could be retrieved by SHA).
+
+    The refspec used is '+refs/pull/*/head:refs/heads/pr/*': pull request refs
+    become LOCAL branches. This is necessary because trufflehog re-clones the
+    repo internally, and a clone drops everything under refs/remotes/.
+
+    trufflehog's Lob detector is excluded by default: it matches 'test_' + 35
+    characters, so any 40-character pytest function name, and its verification
+    returns success on anything.
+EOF
+}
+
+# ------------------------------------------------------------------- utils ---
+
+log() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+# gh through the keyring (ignore an invalid GITHUB_TOKEN from the environment)
+ghapi() { env -u GITHUB_TOKEN gh "$@"; }
+
+# --------------------------------------------------------------- arguments ---
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -o | --org)
+        ORG="${2:?missing value for $1}"
+        shift 2
+        ;;
+    -r | --repo)
+        REPOS+=("${2:?missing value for $1}")
+        shift 2
+        ;;
+    -d | --dir)
+        BASE="${2:?missing value for $1}"
+        shift 2
+        ;;
+    -H | --host)
+        HOST="${2:?missing value for $1}"
+        shift 2
+        ;;
+    -j | --jobs)
+        JOBS="${2:?missing value for $1}"
+        shift 2
+        ;;
+    -L | --limit)
+        LIMIT="${2:?missing value for $1}"
+        shift 2
+        ;;
+    -x | --exclude)
+        EXCLUDE_DETECTORS="${2:?missing value for $1}"
+        shift 2
+        ;;
+    -l | --list)
+        LIST_ONLY=1
+        shift
+        ;;
+    -D | --dump)
+        DO_DUMP=1
+        shift
+        ;;
+    -O | --orphans-only)
+        ORPHANS_ONLY=1
+        shift
+        ;;
+    -s | --scan)
+        DO_SCAN=1
+        shift
+        ;;
+    -F | --forks)
+        WITH_FORKS=1
+        shift
+        ;;
+    -n | --no-pr)
+        WITH_PR=0
+        shift
+        ;;
+    -q | --quiet)
+        QUIET=1
+        shift
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    -V | --version)
+        printf 'gh-miner %s\n' "$VERSION"
+        exit 0
+        ;;
+    --_worker)
+        WORKER_REPO="${2:?}"
+        shift 2
+        ;; # internal (parallel)
+    --)
+        shift
+        break
+        ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *)
+        REPOS+=("$1")
+        shift
+        ;;
+    esac
+done
+
+[ -n "$ORG" ] || {
+    usage >&2
+    die "option -o/--org required"
+}
+need git
+
+[ -n "$BASE" ] || BASE="$PWD/gh-history"
+REPO_DIR="$BASE/repos"
+OBJ_DIR="$BASE/objects"
+REP_DIR="$BASE/reports"
+STAT_DIR="$BASE/.stats"
+
+case "$JOBS" in '' | *[!0-9]*) die "-j expects an integer" ;; esac
+[ "$JOBS" -ge 1 ] || JOBS=1
+
+# --------------------------------------------------------------- repo listing ---
+
+list_repos() {
+    if [ "${#REPOS[@]}" -gt 0 ]; then
+        printf '%s\n' "${REPOS[@]}"
+        return
+    fi
+    command -v gh >/dev/null 2>&1 ||
+        die "gh missing: provide repos with -r, or install gh"
+
+    local jqf='.[] | .name'
+    [ "$WITH_FORKS" -eq 1 ] || jqf='.[] | select(.isFork==false) | .name'
+
+    ghapi repo list "$ORG" \
+        --limit "$LIMIT" --json name,isFork --jq "$jqf" ||
+        die "gh repo list failed for '$ORG'"
+}
+
+# -l: name + approximate size (API diskUsage, in KB).
+list_repos_sized() {
+    if [ "${#REPOS[@]}" -gt 0 ] || ! command -v gh >/dev/null 2>&1; then
+        list_repos
+        return
+    fi
+    local jqf='.[] | select(.isFork==false) | [.name, .diskUsage] | @tsv'
+    [ "$WITH_FORKS" -eq 1 ] && jqf='.[] | [.name, .diskUsage] | @tsv'
+
+    # diskUsage = PACKED size on GitHub's side (delta + zlib). The dump writes
+    # decompressed blobs as separate files (+ block overhead) + PR refs +
+    # orphans + the clone. Measured on Netflix: objects/ ~x11, clones/ ~x3,
+    # i.e. ~x14 total. Estimation factor:
+    local DUMP_FACTOR=14
+
+    {
+        printf 'repo\tpacked\n'
+        ghapi repo list "$ORG" --limit "$LIMIT" \
+            --json name,isFork,diskUsage --jq "$jqf" 2>/dev/null |
+            sort |
+            awk -F'\t' -v f="$DUMP_FACTOR" '
+                function human(kb) {
+                    if (kb>=1048576)   return sprintf("%.1f GB", kb/1048576)
+                    else if (kb>=1024) return sprintf("%.1f MB", kb/1024)
+                    else               return sprintf("%d KB", kb)
+                }
+                { tot+=$2; n++; printf "%s\t%s\n", $1, human($2) }
+                END {
+                    printf "%s\t%s\n", "----", "----"
+                    printf "%s\t%s\n", "TOTAL packed GitHub ("n" repos)", human(tot)
+                    printf "%s\t%s\n", "~ dump on disk (est.)", "~"human(tot*f)" (x"f")"
+                }'
+    } | { column -t -s $'\t' 2>/dev/null || cat; }
+}
+
+# ------------------------------------------------------- processing one repo ---
+
+count_objects() {
+    git -C "$1" count-objects -v 2>/dev/null |
+        awk '/^in-pack:/ {p=$2} /^count:/ {c=$2} END {print c+p}'
+}
+
+clone_or_update() {
+    local repo="$1" dst="$REPO_DIR/$1"
+    if [ -d "$dst/.git" ]; then
+        git -C "$dst" fetch -q --all --prune 2>/dev/null
+    else
+        git clone -q "https://$HOST/$ORG/$repo" "$dst" || return 1
+    fi
+}
+
+fetch_pr_refs() {
+    local dst="$REPO_DIR/$1"
+    # Destination refs/heads/ and not refs/remotes/: a later clone
+    # (the one trufflehog does internally) only copies refs/heads and
+    # refs/tags. A ref stored under refs/remotes would be lost.
+    git -C "$dst" fetch -q origin '+refs/pull/*/head:refs/heads/pr/*' 2>/dev/null
+    # everything else (notes, internal refs), without overwriting branches
+    git -C "$dst" fetch -q origin '+refs/*:refs/remotes/origin/all/*' 2>/dev/null
+    return 0
+}
+
+count_pr_branches() {
+    git -C "$REPO_DIR/$1" for-each-ref --format='%(refname)' refs/heads/pr/ \
+        2>/dev/null | wc -l | tr -d ' '
+}
+
+# Recovers ORPHANED commits by SHA: those no ref reaches anymore (force-push,
+# PRs from deleted forks). SHA sources: events API (PushEvent) + head/merge of
+# every PR. Each SHA missing from the clone is fetched by SHA and anchored
+# under refs/orphans/<sha> (otherwise it would be GC'd). Prints to stdout the
+# number of recovered commits; detail on stderr.
+fetch_sha_orphans() {
+    local repo="$1" dst="$REPO_DIR/$1" out="$OBJ_DIR/$1.orphans.txt"
+    : >"$out"
+
+    if ! command -v gh >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        echo 0
+        return
+    fi
+
+    # candidates = events (push: before/head/commits) + pulls (head/merge)
+    local cand
+    cand="$(
+        {
+            ghapi api "repos/$ORG/$repo/events?per_page=100" --paginate 2>/dev/null |
+                jq -r '.[]? | select(.type=="PushEvent") | .payload
+                       | (.before, .head, (.commits[]?.sha))' 2>/dev/null
+            ghapi api "repos/$ORG/$repo/pulls?state=all&per_page=100" --paginate 2>/dev/null |
+                jq -r '.[]? | (.head.sha, .merge_commit_sha) | select(.!=null)' 2>/dev/null
+        } | tr 'A-Z' 'a-z' | grep -oE '^[0-9a-f]{40}$' | grep -vE '^0{40}$' | sort -u
+    )"
+
+    local ncand=0
+    [ -n "$cand" ] && ncand=$(printf '%s\n' "$cand" | grep -c .)
+
+    local n=0 s
+    for s in $cand; do
+        git -C "$dst" cat-file -e "$s" 2>/dev/null && continue
+        if git -C "$dst" fetch --no-tags -q origin "$s" 2>/dev/null &&
+            git -C "$dst" cat-file -e "$s" 2>/dev/null; then
+            git -C "$dst" update-ref "refs/orphans/$s" "$s" 2>/dev/null
+            printf '%s\n' "$s" >>"$out"
+            n=$((n + 1))
+        fi
+    done
+
+    FS_CAND="$ncand"
+    FS_REC="$n"
+}
+
+# Dumps ONLY the blobs of recovered orphaned commits: those reachable from
+# refs/orphans/* and absent from the set known before recovery
+# ($known = snapshot taken after fetch_pr_refs, before fetch_sha_orphans).
+dump_orphan_blobs() {
+    local repo="$1" known="$2" dst="$REPO_DIR/$1" out="$OBJ_DIR/$1"
+    mkdir -p "$out"
+    [ -s "$OBJ_DIR/$repo.orphans.txt" ] || { echo 0; return; }
+
+    local reach="$dst/.ghm-orph-reach"
+    git -C "$dst" rev-list --objects $(cat "$OBJ_DIR/$repo.orphans.txt") 2>/dev/null |
+        awk 'NF>=1{print $1}' | sort -u >"$reach"
+
+    comm -23 "$reach" "$known" |
+        while read -r o; do
+            [ "$(git -C "$dst" cat-file -t "$o" 2>/dev/null)" = blob ] || continue
+            git -C "$dst" cat-file blob "$o" >"$out/$o" 2>/dev/null || rm -f "$out/$o"
+        done
+    rm -f "$reach"
+    find "$out" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+dump_blobs() {
+    local repo="$1" dst="$REPO_DIR/$1" out="$OBJ_DIR/$1"
+    mkdir -p "$out"
+
+    # --batch-all-objects: every blob in the database, including those brought
+    # in by refs/pull and the fetch by SHA (refs/orphans).
+    git -C "$dst" cat-file --batch-all-objects \
+        --batch-check='%(objectname) %(objecttype)' 2>/dev/null |
+        awk '$2=="blob" {print $1}' |
+        while read -r sha; do
+            git -C "$dst" cat-file blob "$sha" >"$out/$sha" 2>/dev/null ||
+                rm -f "$out/$sha"
+        done
+    find "$out" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+scan_repo() {
+    local repo="$1" dst="$REPO_DIR/$1" rep="$REP_DIR/th-$1.json"
+    local args=(git "file://$dst" --only-verified --no-update --json)
+    [ -n "$EXCLUDE_DETECTORS" ] && args+=(--exclude-detectors="$EXCLUDE_DETECTORS")
+
+    if command -v trufflehog >/dev/null 2>&1; then
+        trufflehog "${args[@]}" >"$rep" 2>/dev/null
+    elif command -v docker >/dev/null 2>&1; then
+        local dargs=(git "file:///repo" --only-verified --no-update --json)
+        [ -n "$EXCLUDE_DETECTORS" ] && dargs+=(--exclude-detectors="$EXCLUDE_DETECTORS")
+        docker run --rm -v "$dst:/repo" \
+            trufflesecurity/trufflehog:latest "${dargs[@]}" >"$rep" 2>/dev/null
+    else
+        warn "neither trufflehog nor docker: scan skipped for $repo"
+        return 0
+    fi
+
+    # count real detections (log lines have no DetectorName)
+    local n
+    n="$(grep -c '"DetectorName"' "$rep" 2>/dev/null)"
+    printf '%s\n' "${n:-0}"
+}
+
+process_repo() {
+    local repo="$1"
+    local before=0 after=0 prs=0 orph=- blobs=- hits=-
+
+    mkdir -p "$REPO_DIR" "$OBJ_DIR" "$REP_DIR" "$STAT_DIR"
+    FS_CAND=0
+    FS_REC=0
+
+    clone_or_update "$repo" || {
+        warn "clone failed: $repo"
+        return 1
+    }
+    before="$(count_objects "$REPO_DIR/$repo")"
+
+    if [ "$WITH_PR" -eq 1 ]; then
+        fetch_pr_refs "$repo"
+        prs="$(count_pr_branches "$repo")"
+    fi
+
+    local dst="$REPO_DIR/$repo" known=""
+    # Recover orphans by SHA before any dump (their blobs enter the dump).
+    # 'after' is counted afterwards -> reflects pr + orphans.
+    if [ "$DO_DUMP" -eq 1 ] || [ "$ORPHANS_ONLY" -eq 1 ]; then
+        if [ "$ORPHANS_ONLY" -eq 1 ]; then
+            # post-pr snapshot: reference to isolate purely orphaned blobs
+            known="$dst/.ghm-known"
+            git -C "$dst" rev-list --objects --all 2>/dev/null |
+                awk 'NF>=1{print $1}' | sort -u >"$known"
+        fi
+        fetch_sha_orphans "$repo"
+        orph="$FS_REC"
+    fi
+    after="$(count_objects "$REPO_DIR/$repo")"
+
+    if [ "$ORPHANS_ONLY" -eq 1 ]; then
+        blobs="$(dump_orphan_blobs "$repo" "$known")"
+        rm -f "$known"
+    elif [ "$DO_DUMP" -eq 1 ]; then
+        blobs="$(dump_blobs "$repo")"
+    fi
+    [ "$DO_SCAN" -eq 1 ] && hits="$(scan_repo "$repo")"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$repo" "$before" "$after" "$prs" "$orph" "$blobs" "$hits" \
+        >"$STAT_DIR/$repo.tsv"
+
+    # one self-identified line per repo: insensitive to -j interleaving
+    log "=== $repo | obj $before->$after | pr $prs | orphans $orph/$FS_CAND | blobs $blobs | detections $hits"
+}
+
+# ------------------------------------------------------------------- worker ---
+
+if [ -n "$WORKER_REPO" ]; then
+    process_repo "$WORKER_REPO"
+    exit $?
+fi
+
+# --------------------------------------------------------------------- main ---
+
+if [ "$LIST_ONLY" -eq 1 ]; then
+    list_repos_sized
+    exit 0
+fi
+
+mapfile -t ALL_REPOS < <(list_repos)
+[ "${#ALL_REPOS[@]}" -gt 0 ] || die "no repo found"
+
+log "target: $ORG (${#ALL_REPOS[@]} repos) -> $BASE"
+mkdir -p "$REPO_DIR" "$OBJ_DIR" "$REP_DIR" "$STAT_DIR"
+rm -f "$STAT_DIR"/*.tsv 2>/dev/null
+
+# Rebuild the flags to pass to workers.
+FLAGS=(-o "$ORG" -d "$BASE" -H "$HOST" -x "$EXCLUDE_DETECTORS")
+[ "$DO_DUMP" -eq 1 ] && FLAGS+=(-D)
+[ "$ORPHANS_ONLY" -eq 1 ] && FLAGS+=(-O)
+[ "$DO_SCAN" -eq 1 ] && FLAGS+=(-s)
+[ "$WITH_PR" -eq 0 ] && FLAGS+=(-n)
+[ "$QUIET" -eq 1 ] && FLAGS+=(-q)
+
+if [ "$JOBS" -gt 1 ]; then
+    # -P n: n concurrent processes. -I{} substitutes the repo read from stdin.
+    printf '%s\n' "${ALL_REPOS[@]}" |
+        xargs -P "$JOBS" -I{} "$SELF" "${FLAGS[@]}" --_worker {}
+else
+    for repo in "${ALL_REPOS[@]}"; do
+        process_repo "$repo"
+    done
+fi
+
+# ------------------------------------------------------------------ report ---
+
+STATS="$REP_DIR/stats.tsv"
+{
+    printf 'repo\tbefore\tafter\tpr\torphans\tblobs\tdetections\n'
+    cat "$STAT_DIR"/*.tsv 2>/dev/null | sort
+} >"$STATS"
+
+if [ "$QUIET" -eq 0 ]; then
+    echo
+    column -t -s $'\t' "$STATS" 2>/dev/null || cat "$STATS"
+    echo
+    echo "report: $STATS"
+
+    # Repos with the widest before/after gap hide the most content off-branch:
+    # that is where to look first.
+    echo
+    echo "repos to look at first (object gain via refs/pull + SHA):"
+    tail -n +2 "$STATS" |
+        awk -F'\t' '$3>$2 {printf "  %-38s +%-7d (x%.1f)\n", $1, $3-$2, $3/$2}' |
+        sort -t+ -k2 -rn | head -5
+fi
