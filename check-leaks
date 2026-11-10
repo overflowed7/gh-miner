@@ -1,0 +1,986 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["requests", "boto3", "cryptography", "dnspython"]
+# ///
+"""
+check-leaks — extract secrets from a dump (git objects, repo checkout, JS
+bundles…) and check which ones are live, ONLY through read-only identity calls
+(whoami). Only the HTTP status is looked at: no content read, nothing written,
+no message sent.
+
+Usage:
+  check-leaks <dir> [options]
+
+  --offline        no network at all (JWT decoding, key fingerprints, DB/SAS classification)
+  --no-generic     disable the generic name="value" extractor
+  --exclude=a,b    skip these directory names (e.g. upstream forks)
+  --hosts=h1,h2:p  compare found private keys with the TLS key these hosts serve now
+  --domains=a.com  target domains: collect hostnames under them from the dump and
+                   check their live TLS key; flag crt.sh certificates for them
+  --no-crtsh       skip the crt.sh lookup of private keys
+  --pk-all         also triage keys found in TEST / VENDOR files
+
+Coverage: cloud (AWS, GCP service accounts, Azure connection strings / SAS),
+SaaS tokens, webhooks, DB URIs (DNS + TCP only, NEVER authenticates), private
+keys (SPKI fingerprint, dedup, crt.sh + live TLS comparison), JWT, generic.
+
+Outputs (current directory):
+  leaks_checked.json      one entry per test, with source file and context
+  generic_candidates.tsv  high-entropy values assigned to secret-like names
+"""
+import base64, hashlib, hmac, ipaddress, json, math, os, re, socket, sys, time
+from email.utils import formatdate
+from urllib.parse import parse_qs, unquote, urlsplit
+from collections import Counter
+
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+ROOT = ARGS[0] if ARGS else "objects"
+OFFLINE = "--offline" in sys.argv
+GENERIC = "--no-generic" not in sys.argv
+CRTSH = "--no-crtsh" not in sys.argv
+PK_ALL = "--pk-all" in sys.argv          # also triage keys found in TEST/VENDOR files
+
+
+def _list_arg(name):
+    out = []
+    for a in sys.argv[1:]:
+        if a.startswith(f"--{name}="):
+            out += [x.strip() for x in a.split("=", 1)[1].split(",") if x.strip()]
+    return out
+
+
+HOSTS = _list_arg("hosts")               # host[:port] whose live TLS key is compared to found keys
+DOMAINS = [d.lower().lstrip(".") for d in _list_arg("domains")]  # target domains: auto-collect hosts + flag crt.sh names
+MAX_SIZE = 2_000_000
+MIN_ENTROPY = 3.0
+
+PLACEHOLDER = re.compile(
+    r"^(x+|dummy|secret|changeme|johndoe|bar|foo.*|your[-_].*|<.*>|.*\*{4,}.*|"
+    r".*x{8,}.*|.*X{8,}.*|.*EXAMPLE.*|.*example.*|.*1234567890.*|.*0{10,}.*|"
+    r"4y/caOkhg324kgk342hkh3w4/iHLKJGHhkjl4hjkhKG)$")
+NOISE_PREFIX = ('{"version":3,"sources"', "(window.webpackJsonp", "webpackJsonp(",
+                "/*! jQuery", "!function(")
+
+
+def entropy(s):
+    n = len(s)
+    return -sum(c / n * math.log2(c / n) for c in Counter(s).values()) if n else 0.0
+
+
+def mask(v, kind=""):
+    if kind == "private_key":
+        return re.search(r"BEGIN (.*?)-----", v).group(1)
+    if kind in ("gcp_sa", "okta"):
+        a, b = v.split("|", 1)
+        return f"{a[:24]}|{mask(b)}"
+    if kind == "db_uri":  # hide the password
+        return re.sub(r"(://[^:@/]*:)[^@]+@", r"\1***@", v)[:38]
+    return v if not v or len(v) < 14 else f"{v[:14]}…{v[-4:]}"
+
+
+# ================================================================ checks
+def bearer(t):
+    return {"Authorization": f"Bearer {t}"}
+
+
+def http(method, url, ok=(200,), dead=(401,), **kw):
+    """Identity call: only the HTTP status is looked at."""
+    import requests
+    kw.setdefault("timeout", 10)
+    c = requests.request(method, url, **kw).status_code
+    if c in ok:
+        return "VALID", f"HTTP {c}"
+    if c in dead:
+        return "DEAD", f"HTTP {c}"
+    if c == 403:
+        return "MAYBE", "HTTP 403: key recognised but missing permissions? check manually"
+    return "UNKNOWN", f"HTTP {c}"
+
+
+def chk_aws(key_id, secret):
+    import boto3, botocore
+    try:
+        r = boto3.client("sts", region_name="us-east-1", aws_access_key_id=key_id,
+                         aws_secret_access_key=secret or "A" * 40).get_caller_identity()
+        return "VALID", r["Arn"]
+    except botocore.exceptions.ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code == "SignatureDoesNotMatch":
+            return "KEYID_ACTIVE", "key ID active, secret wrong or missing"
+        if code == "InvalidClientTokenId":
+            return "DEAD", code
+        return "UNKNOWN", code
+
+
+def chk_google_oauth(cid, secret):
+    import requests
+    j = requests.post("https://oauth2.googleapis.com/token", timeout=10, data={
+        "client_id": cid, "client_secret": secret or "x",
+        "grant_type": "authorization_code", "code": "invalid",
+        "redirect_uri": "http://localhost"}).json()
+    err, desc = j.get("error"), j.get("error_description", "")
+    if err == "invalid_grant":
+        return "VALID", "paire client_id/secret active"
+    if err == "deleted_client":
+        return "DEAD", "client deleted"
+    if err == "invalid_client" and "Unauthorized" in desc:
+        return "CLIENT_EXISTS", "client active, secret wrong or missing"
+    return "DEAD", f"{err}: {desc}"
+
+
+def chk_google_token(t):
+    import requests
+    c = requests.get("https://oauth2.googleapis.com/tokeninfo",
+                     params={"access_token": t}, timeout=10).status_code
+    return ("VALID", "HTTP 200") if c == 200 else ("DEAD", f"HTTP {c}")
+
+
+def chk_github(t):
+    import requests
+    r = requests.get("https://api.github.com/user", timeout=10,
+                     headers={"Authorization": f"token {t}"})
+    if r.status_code == 200:
+        return "VALID", f"login={r.json().get('login')} scopes={r.headers.get('X-OAuth-Scopes')}"
+    return "DEAD", f"HTTP {r.status_code}"
+
+
+def chk_gitlab(t):
+    s, i = http("GET", "https://gitlab.com/api/v4/user", headers=bearer(t))
+    return (s, i + " (gitlab.com only; may belong to a self-hosted GitLab)") if s == "DEAD" else (s, i)
+
+
+def chk_slack(t):
+    import requests
+    j = requests.post("https://slack.com/api/auth.test", timeout=10, headers=bearer(t)).json()
+    return ("VALID", f"team={j.get('team')} url={j.get('url')}") if j.get("ok") \
+        else ("DEAD", j.get("error"))
+
+
+def chk_slack_hook(url):
+    # Empty text: Slack rejects without posting; the error tells whether the hook exists.
+    import requests
+    body = requests.post(url, json={"text": ""}, timeout=10).text
+    if "missing_text" in body or "no_text" in body:
+        return "VALID", "webhook active (nothing was posted)"
+    return "DEAD", body[:60]
+
+
+def chk_mailchimp(t):
+    dc = t.rsplit("-", 1)[1]
+    return http("GET", f"https://{dc}.api.mailchimp.com/3.0/ping", auth=("x", t))
+
+
+def chk_telegram(t):
+    import requests
+    c = requests.get(f"https://api.telegram.org/bot{t}/getMe", timeout=10).status_code
+    return ("VALID", "HTTP 200") if c == 200 else ("DEAD", f"HTTP {c}")
+
+
+def chk_newrelic(t):
+    if not t.startswith("NRAK-"):
+        return "MANUAL", "New Relic ingest/browser key: no whoami endpoint"
+    return http("POST", "https://api.newrelic.com/graphql", headers={"API-Key": t},
+                json={"query": "{ actor { user { id } } }"})
+
+
+# ---------------------------------------------------------------- Azure
+AZURITE_KEY = ("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/"
+               "K1SZFPTOtr/KBHBeksoGMGw==")
+
+
+def _azure_conn(cs):
+    f = dict(p.split("=", 1) for p in cs.strip(";").split(";") if "=" in p)
+    return f.get("AccountName"), f.get("AccountKey"), f
+
+
+def chk_azure_conn(cs):
+    """SharedKey-signed Get Blob Service Properties: config read, HTTP status only."""
+    import requests
+    acct, key, f = _azure_conn(cs)
+    if not acct or not key:
+        return "MANUAL", "AccountName or AccountKey missing"
+    if acct == "devstoreaccount1" or key == AZURITE_KEY:
+        return "PUBLIC", "Azurite / emulator key (public)"
+    base = f.get("BlobEndpoint") or \
+        f"{f.get('DefaultEndpointsProtocol', 'https')}://{acct}.blob.{f.get('EndpointSuffix', 'core.windows.net')}"
+    base = base.rstrip("/")
+    path = urlsplit(base).path  # emulator: /devstoreaccount1
+    date, ver = formatdate(usegmt=True), "2021-08-06"
+    sts = "GET\n" + "\n" * 11 + f"x-ms-date:{date}\nx-ms-version:{ver}\n" \
+          f"/{acct}{path}/\ncomp:properties\nrestype:service"
+    try:
+        sig = base64.b64encode(hmac.new(base64.b64decode(key), sts.encode(),
+                                        hashlib.sha256).digest()).decode()
+    except Exception:
+        return "UNPARSEABLE", "AccountKey non base64"
+    try:
+        c = requests.get(f"{base}/?restype=service&comp=properties", timeout=10, headers={
+            "x-ms-date": date, "x-ms-version": ver,
+            "Authorization": f"SharedKey {acct}:{sig}"}).status_code
+    except requests.exceptions.ConnectionError:
+        return "DEAD", f"account {acct} does not exist (DNS)"
+    if c == 200:
+        return "VALID", f"account={acct} key active"
+    if c == 403:
+        return "DEAD", f"account={acct} exists, key revoked or wrong"
+    return "UNKNOWN", f"HTTP {c}"
+
+
+def chk_azure_sas(url):
+    import requests
+    url = url.replace("&amp;", "&").replace("\\u0026", "&")
+    u = urlsplit(url)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    se, sp = q.get("se", ""), q.get("sp", "?")
+    info = f"account={u.hostname.split('.')[0]} sp={sp} se={se or '-'}"
+    if se:
+        try:
+            t = time.mktime(time.strptime(se[:19].rstrip("Z"), "%Y-%m-%dT%H:%M:%S"))
+            if t < time.time():
+                return "EXPIRED", info
+        except ValueError:
+            try:
+                if time.mktime(time.strptime(se[:10], "%Y-%m-%d")) < time.time():
+                    return "EXPIRED", info
+            except ValueError:
+                pass
+    if u.path in ("", "/"):
+        return "MANUAL", info + " (unexpired account SAS: no HEAD without a resource path)"
+    if OFFLINE:
+        return "NOT_EXPIRED", info
+    # HEAD: metadata only, no content downloaded
+    try:
+        c = requests.head(url, timeout=10).status_code
+    except requests.exceptions.ConnectionError:
+        return "DEAD", info + " (DNS)"
+    if c == 200:
+        return "VALID", info
+    if c in (403, 404):
+        return "DEAD", info + f" HTTP {c}"
+    return "UNKNOWN", info + f" HTTP {c}"
+
+
+# ---------------------------------------------------------------- GCP service accounts
+def chk_gcp_sa(pair):
+    """Public x509 endpoint: no authentication, the key is never used."""
+    import requests
+    email, kid = pair.split("|", 1)
+    r = requests.get(f"https://www.googleapis.com/service_accounts/v1/metadata/x509/{email}",
+                     timeout=10)
+    if r.status_code == 404:
+        return "DEAD", f"{email}: service account deleted"
+    if r.status_code != 200:
+        return "UNKNOWN", f"HTTP {r.status_code}"
+    if kid in r.json():
+        return "VALID", f"{email}: key_id {kid[:8]}… ACTIVE (public x509 check)"
+    return "DEAD", f"{email} exists, key {kid[:8]}… revoked"
+
+
+# ---------------------------------------------------------------- Okta / Discord
+def chk_okta(pair):
+    dom, tok = pair.split("|", 1)
+    if dom == "?":
+        return "MANUAL", "SSWS token without an Okta domain in the file: GET https://<org>.okta.com/api/v1/users/me"
+    return http("GET", f"https://{dom}/api/v1/users/me",
+                headers={"Authorization": f"SSWS {tok}", "Accept": "application/json"})
+
+
+def discord_bot_ok(t):
+    """The first segment of a bot token is the bot user id (17-20 digits) in base64."""
+    seg = t.split(".")[0]
+    try:
+        uid = base64.b64decode(seg + "=" * (-len(seg) % 4)).decode()
+    except Exception:
+        return False
+    return uid.isdigit() and 17 <= len(uid) <= 20
+
+
+def chk_discord_hook(url):
+    # GET on a webhook returns its metadata, nothing is posted
+    import requests
+    r = requests.get(url, timeout=10)
+    if r.status_code == 200:
+        j = r.json()
+        return "VALID", f"webhook active guild={j.get('guild_id')} channel={j.get('channel_id')}"
+    return "DEAD", f"HTTP {r.status_code}"
+
+
+# ---------------------------------------------------------------- database URIs
+DB_PORTS = {"postgres": 5432, "postgresql": 5432, "mysql": 3306, "mariadb": 3306,
+            "mongodb": 27017, "mongodb+srv": 27017, "redis": 6379, "rediss": 6379,
+            "amqp": 5672, "amqps": 5671, "mssql": 1433, "sqlserver": 1433}
+DB_PW_PLACEHOLDER = re.compile(
+    r"^(pass(word)?\d*|secret|changeme|change_?me|root|admin|test\w*|postgres|mysql|mongo|redis|"
+    r"guest|user|pwd|example|dbpass|mypass\w*|\$.*|<.*|%.*|\{.*|\*+|x+|\.+)$", re.I)
+LOCAL_HOST = re.compile(
+    r"^(localhost|.*\.local|.*\.localhost|.*\.internal|.*\.svc(\.cluster\.local)?|"
+    r"host\.docker\.internal|.*example\.(com|org|net)|.*\.test|.*\.invalid)$", re.I)
+
+
+def db_parse(uri):
+    scheme, rest = uri.split("://", 1)
+    cred, _, hostpart = rest.rpartition("@")
+    user, _, pw = cred.partition(":")
+    first = re.split(r"[,/?]", hostpart, maxsplit=1)[0]
+    host, _, port = first.partition(":")
+    if host.startswith("["):  # IPv6
+        host, _, port = first[1:].partition("]:")
+    return scheme.lower(), unquote(user), unquote(pw), host.lower(), \
+        int(port) if port.isdigit() else DB_PORTS.get(scheme.lower(), 0)
+
+
+def chk_db_uri(uri):
+    """DNS + connexion TCP nue : AUCUNE tentative d'authentification."""
+    scheme, user, pw, host, port = db_parse(uri)
+    info = f"{scheme} {user}@{host}:{port}"
+    if not pw or DB_PW_PLACEHOLDER.match(pw) or len(pw) < 4:
+        return "FIXTURE", info + " (placeholder password)"
+    try:
+        if ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback:
+            return "LOCAL", info + " (private IP)"
+    except ValueError:
+        if "." not in host or LOCAL_HOST.match(host):
+            return "LOCAL", info + " (local / docker / example host)"
+    if OFFLINE:
+        return "SKIPPED", info
+    targets = [(host, port)]
+    if scheme == "mongodb+srv":
+        try:
+            import dns.resolver
+            ans = dns.resolver.resolve(f"_mongodb._tcp.{host}", "SRV", lifetime=5)
+            targets = [(str(a.target).rstrip("."), a.port) for a in ans]
+        except Exception as e:
+            return "UNREACHABLE", info + f" (no SRV record: {type(e).__name__})"
+    for h, p in targets[:3]:
+        try:
+            socket.getaddrinfo(h, p)
+        except socket.gaierror:
+            continue
+        try:
+            socket.create_connection((h, p), timeout=4).close()
+            return "REACHABLE", info + f" port open ({h}:{p}) — auth NOT tested"
+        except OSError:
+            pass
+    return "UNREACHABLE", info + " (DNS failure or filtered port; may sit behind a VPN)"
+
+
+# ---------------------------------------------------------------- private keys
+def pem_normalize(block):
+    """Rebuild a key pasted into code (escaped \\n, diff prefixes, quotes)."""
+    block = block.replace("\\n", "\n").replace("\\r", "")
+    raw = [l.strip() for l in block.splitlines() if l.strip()]
+    # diff prefix only if EVERY line has it (a base64 line may start with '+')
+    # (first line excluded: the match starts at -----BEGIN, after the prefix)
+    diff = len(raw) > 2 and all(l[:1] in "+-" and not l.startswith("-----") for l in raw[1:])
+    lines = []
+    for i, l in enumerate(raw):
+        if diff and i > 0:
+            l = l[1:].strip()
+        l = re.sub(r"""["'`]\s*\+?\s*[,;)]*\s*$""", "", l)      # end:  "...", / "..." +
+        l = re.sub(r"""^\s*\+?\s*["'`]""", "", l)               # start: + "...
+        l = l.rstrip("\\").strip("\"'` ")
+        if l:
+            lines.append(l)
+    head = next((l for l in lines if l.startswith("-----BEGIN")), "")
+    m = re.search(r"-----BEGIN (.*?PRIVATE KEY)-----", head)
+    if not m:
+        return None
+    kind = m.group(1)
+    hdrs = [l for l in lines if ":" in l and not l.startswith("-----")]  # Proc-Type, DEK-Info
+    body = "".join(l for l in lines if not l.startswith("-----") and ":" not in l)
+    body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
+    wrapped = "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
+    extra = ("\n".join(hdrs) + "\n\n") if hdrs else ""
+    return f"-----BEGIN {kind}-----\n{extra}{wrapped}\n-----END {kind}-----\n"
+
+
+def chk_private_key(pem):
+    from cryptography.hazmat.primitives import serialization as s
+    kind = re.match(r"-----BEGIN (.*)-----", pem).group(1)
+    if "ENCRYPTED" in kind or "Proc-Type: 4,ENCRYPTED" in pem:
+        return "ENCRYPTED", f"{kind} encrypted (passphrase required): almost always a fixture"
+    try:
+        k = s.load_ssh_private_key(pem.encode(), None) if "OPENSSH" in kind \
+            else s.load_pem_private_key(pem.encode(), None)
+    except Exception as e:
+        return "UNPARSEABLE", f"{kind}: {type(e).__name__} (truncated / concatenated?)"
+    spki = k.public_key().public_bytes(s.Encoding.DER, s.PublicFormat.SubjectPublicKeyInfo)
+    fp = hashlib.sha256(spki).hexdigest()
+    return "MANUAL", f"spki_sha256={fp[:16]} {type(k).__name__.replace('_PrivateKey', '')} " \
+                     "→ compare with deployed certs (crt.sh / live TLS)"
+
+
+def chk_jwt(tok):
+    def dec(s):
+        return json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+    try:
+        h, p = (dec(x) for x in tok.split(".")[:2])
+    except Exception:
+        return "UNPARSEABLE", ""
+    exp = p.get("exp")
+    state = "NO_EXP" if not exp else ("EXPIRED" if exp < time.time() else "NOT_EXPIRED")
+    try:
+        exp_s = time.strftime("%Y-%m-%d", time.gmtime(exp)) if exp else "-"
+    except (OverflowError, OSError, ValueError):
+        exp_s = str(exp)
+    return state, f"alg={h.get('alg')} iss={p.get('iss')} sub={p.get('sub')} exp={exp_s}"
+
+
+# ================================================================ detectors
+# (name, prefilter substrings, regex with 1 group, check)
+# check = function(value) -> (state, info)  |  string = fixed state, no network call
+JWT_RX = r"\b(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})"
+DETECTORS = [
+    ("aws_key_id", ("AKIA", "ASIA"), r"\b((?:AKIA|ASIA)[0-9A-Z]{16})\b", None),
+    ("aws_other_id", ("AROA", "AIDA", "AGPA", "AIPA", "ANPA", "ANVA", "ABIA", "ACCA", "APKA"),
+     r"\b((?:AROA|AIDA|AGPA|AIPA|ANPA|ANVA|ABIA|ACCA|APKA)[0-9A-Z]{16})\b", "INFO"),
+    ("google_api_key", ("AIza",), r"\b(AIza[0-9A-Za-z_-]{35})\b", "MANUAL"),
+    ("google_oauth_token", ("ya29.",), r"\b(ya29\.[0-9A-Za-z_-]{20,})", chk_google_token),
+    ("github", ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"),
+     r"\b(gh[pousr]_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{82})\b", chk_github),
+    ("gitlab", ("glpat-",), r"\b(glpat-[0-9A-Za-z_-]{20})\b", chk_gitlab),
+    ("stripe_secret", ("sk_live", "sk_test", "rk_live", "rk_test"),
+     r"\b((?:sk|rk)_(?:live|test)_[0-9A-Za-z]{24,})",
+     lambda t: http("GET", "https://api.stripe.com/v1/account", auth=(t, ""))),
+    ("stripe_publishable", ("pk_live", "pk_test"), r"\b(pk_(?:live|test)_[0-9A-Za-z]{24,})", "PUBLIC"),
+    ("stripe_webhook", ("whsec_",), r"\b(whsec_[0-9A-Za-z]{32,})", "MANUAL"),
+    ("slack", ("xox",), r"\b(xox[baprs]-[0-9A-Za-z-]{10,})", chk_slack),
+    ("slack_app", ("xapp-",), r"\b(xapp-[0-9A-Za-z-]{10,})", "MANUAL"),
+    ("slack_hook", ("hooks.slack.com",), r"(https://hooks\.slack\.com/services/[A-Za-z0-9/]{40,})", chk_slack_hook),
+    ("sendgrid", ("SG.",), r"\b(SG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43})\b",
+     lambda t: http("GET", "https://api.sendgrid.com/v3/scopes", headers=bearer(t))),
+    ("twilio_sid", ("AC", "SK"), r"\b((?:AC|SK)[0-9a-f]{32})\b", "MANUAL"),
+    ("mailgun", ("key-",), r"\b(key-[0-9a-f]{32})\b",
+     lambda t: http("GET", "https://api.mailgun.net/v3/domains?limit=1", auth=("api", t))),
+    ("mailchimp", ("-us",), r"\b([0-9a-f]{32}-us[0-9]{1,2})\b", chk_mailchimp),
+    ("telegram_bot", (), r"\b([0-9]{8,10}:[A-Za-z0-9_-]{35})\b", chk_telegram),
+    ("openai", ("sk-",), r"\b(sk-(?!ant-)(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,})",
+     lambda t: http("GET", "https://api.openai.com/v1/models", headers=bearer(t))),
+    ("anthropic", ("sk-ant-",), r"\b(sk-ant-[A-Za-z0-9_-]{20,})",
+     lambda t: http("GET", "https://api.anthropic.com/v1/models",
+                    headers={"x-api-key": t, "anthropic-version": "2023-06-01"})),
+    ("huggingface", ("hf_",), r"\b(hf_[0-9A-Za-z]{34})\b",
+     lambda t: http("GET", "https://huggingface.co/api/whoami-v2", headers=bearer(t))),
+    ("groq", ("gsk_",), r"\b(gsk_[0-9A-Za-z]{20,})",
+     lambda t: http("GET", "https://api.groq.com/openai/v1/models", headers=bearer(t))),
+    ("replicate", ("r8_",), r"\b(r8_[0-9A-Za-z]{37})\b",
+     lambda t: http("GET", "https://api.replicate.com/v1/account", headers=bearer(t))),
+    ("npm", ("npm_",), r"\b(npm_[0-9A-Za-z]{36})\b",
+     lambda t: http("GET", "https://registry.npmjs.org/-/whoami", headers=bearer(t))),
+    ("pypi", ("pypi-AgEIcHlwaS5vcmc",), r"(pypi-AgEIcHlwaS5vcmc[0-9A-Za-z_-]{50,})", "MANUAL"),
+    ("rubygems", ("rubygems_",), r"\b(rubygems_[0-9a-f]{48})\b", "MANUAL"),
+    ("nuget", ("oy2",), r"\b(oy2[a-z0-9]{43})\b", "MANUAL"),
+    ("vault", ("hvs.", "hvb."), r"\b(hv[sb]\.[0-9A-Za-z_-]{24,})", "MANUAL"),
+    ("doppler", ("dp.",), r"\b(dp\.(?:pt|st|ct|sa|scim|audit)\.[0-9A-Za-z]{40,})",
+     lambda t: http("GET", "https://api.doppler.com/v3/me", headers=bearer(t))),
+    ("terraform", (".atlasv1.",), r"\b([A-Za-z0-9]{14}\.atlasv1\.[0-9A-Za-z_-]{60,})",
+     lambda t: http("GET", "https://app.terraform.io/api/v2/account/details", headers=bearer(t))),
+    ("databricks", ("dapi",), r"\b(dapi[0-9a-f]{32})\b", "MANUAL"),
+    ("digitalocean", ("_v1_",), r"\b(do[oprt]_v1_[0-9a-f]{64})\b",
+     lambda t: http("GET", "https://api.digitalocean.com/v2/account", headers=bearer(t))),
+    ("shopify", ("shpat_", "shpca_", "shppa_", "shpss_"), r"\b(shp(?:at|ca|pa|ss)_[0-9a-fA-F]{32})\b", "MANUAL"),
+    ("supabase", ("sbp_",), r"\b(sbp_[0-9a-f]{40})\b",
+     lambda t: http("GET", "https://api.supabase.com/v1/projects", headers=bearer(t))),
+    ("vercel", ("vcp_", "vci_", "vcr_", "vca_", "vck_"), r"\b(vc[pirak]_[A-Za-z0-9]{24,})",
+     lambda t: http("GET", "https://api.vercel.com/v2/user", headers=bearer(t))),
+    ("postman", ("PMAK-",), r"\b(PMAK-[0-9a-f]{24}-[0-9a-f]{34})\b",
+     lambda t: http("GET", "https://api.getpostman.com/me", headers={"X-Api-Key": t})),
+    ("figma", ("figd_",), r"\b(figd_[0-9A-Za-z_-]{40,})",
+     lambda t: http("GET", "https://api.figma.com/v1/me", headers={"X-Figma-Token": t})),
+    ("linear", ("lin_api_",), r"\b(lin_api_[0-9A-Za-z]{40})\b",
+     lambda t: http("POST", "https://api.linear.app/graphql", dead=(400, 401),
+                    headers={"Authorization": t}, json={"query": "{ viewer { id } }"})),
+    ("notion", ("secret_", "ntn_"), r"\b((?:secret_|ntn_)[0-9A-Za-z]{43,})",
+     lambda t: http("GET", "https://api.notion.com/v1/users/me",
+                    headers={**bearer(t), "Notion-Version": "2022-06-28"})),
+    ("sentry", ("sntrys_", "sntryu_"), r"\b(sntry[su]_[0-9A-Za-z_=-]{40,})",
+     lambda t: http("GET", "https://sentry.io/api/0/organizations/", headers=bearer(t))),
+    ("newrelic", ("NRAK-", "NRII-", "NRJS-", "NRAA-", "NRRA-", "NRIQ-"),
+     r"\b(NR[A-Z]{2}-[0-9A-Za-z]{27})\b", chk_newrelic),
+    ("dropbox", ("sl.",), r"\b(sl\.[0-9A-Za-z_-]{130,})",
+     lambda t: http("POST", "https://api.dropboxapi.com/2/users/get_current_account",
+                    dead=(400, 401), headers=bearer(t))),
+    ("airtable", ("pat",), r"\b(pat[0-9A-Za-z]{14}\.[0-9a-f]{64})\b",
+     lambda t: http("GET", "https://api.airtable.com/v0/meta/whoami", headers=bearer(t))),
+    ("atlassian", ("ATATT3x",), r"(ATATT3x[0-9A-Za-z_=.-]{20,})", "MANUAL"),
+    ("square", ("sq0atp-", "EAAA"), r"\b(sq0atp-[0-9A-Za-z_-]{22,}|EAAA[0-9A-Za-z_-]{60})",
+     lambda t: http("GET", "https://connect.squareup.com/v2/locations", headers=bearer(t))),
+    ("square_secret", ("sq0csp-",), r"\b(sq0csp-[0-9A-Za-z_-]{22,})", "MANUAL"),
+    ("tailscale", ("tskey-",), r"\b(tskey-(?:auth|api|client)-[0-9A-Za-z-]{10,})", "MANUAL"),
+    ("pulumi", ("pul-",), r"\b(pul-[0-9a-f]{40})\b",
+     lambda t: http("GET", "https://api.pulumi.com/api/user", headers={"Authorization": f"token {t}"})),
+    ("prefect", ("pnu_",), r"\b(pnu_[0-9A-Za-z]{36})\b",
+     lambda t: http("GET", "https://api.prefect.cloud/api/me/", headers=bearer(t))),
+    ("braintree", ("access_token$production$",),
+     r"(access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32})", "MANUAL"),
+    ("jwt", ("eyJ",), JWT_RX, chk_jwt),
+    ("private_key", ("PRIVATE KEY-----",),
+     r"(-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]{40,10000}?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----)",
+     chk_private_key),
+    # ---- v2
+    ("azure_conn", ("AccountKey=",),
+     r"((?:[A-Za-z]+=[^;\s\"'<>]+;){1,6}AccountKey=[A-Za-z0-9+/]{86}==(?:;[A-Za-z]+=[^;\s\"'<>]+)*)",
+     chk_azure_conn),
+    ("azure_sas", ("sig=",),
+     r"(https://[a-z0-9]{3,24}\.(?:blob|file|queue|table|dfs)\.core\.windows\.net/[^\s\"'<>`]*\?[^\s\"'<>`]*sig=[A-Za-z0-9%+/=]{20,}[^\s\"'<>`]*)",
+     chk_azure_sas),
+    ("heroku", ("HRKU-",), r"\b(HRKU-[0-9A-Za-z_-]{20,})",
+     lambda t: http("GET", "https://api.heroku.com/account",
+                    headers={**bearer(t), "Accept": "application/vnd.heroku+json; version=3"})),
+    ("heroku_legacy", ("~heroku",),
+     r"(?i)heroku[\w.-]{0,20}(?:key|token)[\"']?\s*[:=]\s*[\"']?([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\b",
+     lambda t: http("GET", "https://api.heroku.com/account",
+                    headers={**bearer(t), "Accept": "application/vnd.heroku+json; version=3"})),
+    ("cloudflare_token", ("~cloudflare", "~cf_api", "~cf-api", "~cf_token"),
+     r"(?i)(?:cloudflare|\bcf)[\w.-]{0,15}token[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_-]{40})(?![A-Za-z0-9_-])",
+     lambda t: http("GET", "https://api.cloudflare.com/client/v4/user/tokens/verify",
+                    dead=(400, 401), headers=bearer(t))),
+    ("cloudflare_global", ("~cloudflare", "~cf_api", "~cf-api"),
+     r"(?i)(?:cloudflare|\bcf)[\w.-]{0,15}(?:api[_-]?)?key[\"']?\s*[:=]\s*[\"']?([0-9a-f]{37})\b", "MANUAL"),
+    ("cloudflare_origin_ca", ("v1.0-",), r"\b(v1\.0-[0-9a-f]{24}-[0-9a-f]{146})\b", "MANUAL"),
+    ("discord_bot", (), r"\b([MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,40})\b",
+     lambda t: http("GET", "https://discord.com/api/v10/users/@me", headers={"Authorization": f"Bot {t}"})),
+    ("discord_hook", ("/api/webhooks/",),
+     r"(https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d{17,20}/[A-Za-z0-9_-]{60,70})",
+     chk_discord_hook),
+    ("db_uri", ("://",),
+     r"\b((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)://"
+     r"[^\s:@/\"'<>`]*:[^\s@/\"'<>`]+@[A-Za-z0-9.\[\]:,_-]+[^\s\"'<>`]*)",
+     chk_db_uri),
+]
+
+# Composite detectors: value = "a|b" built from the same file
+GCP_SA_EMAIL = re.compile(r'"client_email"\s*:\s*"([^"@\s]+@[^"\s]+\.iam\.gserviceaccount\.com|[^"@\s]+@developer\.gserviceaccount\.com)"')
+GCP_SA_KID = re.compile(r'"private_key_id"\s*:\s*"([0-9a-f]{40})"')
+OKTA_DOMAIN = re.compile(r"\b([a-z0-9-]+\.(?:okta|oktapreview|okta-emea|okta-gov)\.com)\b", re.I)
+OKTA_TOKEN = re.compile(r"(?i)(?:SSWS\s+|okta[\w.-]{0,20}(?:token|key)[\"']?\s*[:=]\s*[\"']?)(00[A-Za-z0-9_-]{40})(?![A-Za-z0-9_-])")
+
+
+def composite_hits(text, low):
+    out = {}
+    if '"service_account"' in text:
+        emails = [(m.start(), m.group(1)) for m in GCP_SA_EMAIL.finditer(text)]
+        for m in GCP_SA_KID.finditer(text):  # client_email closest to this key id
+            if emails:
+                e = min(emails, key=lambda x: abs(x[0] - m.start()))[1]
+                out.setdefault("gcp_sa", set()).add(f"{e}|{m.group(1)}")
+    if "okta" in low or "ssws" in low:
+        toks = {m.group(1) for m in OKTA_TOKEN.finditer(text)}
+        doms = {d.lower() for d in OKTA_DOMAIN.findall(text)} or {"?"}
+        out.update({"okta": {f"{d}|{t}" for d in doms for t in toks}} if toks else {})
+    return out
+
+
+VALIDATORS = {"discord_bot": discord_bot_ok}
+COMPOSITE_CHECKS = {"gcp_sa": chk_gcp_sa, "okta": chk_okta, "cloudfront_keypair_id": "PUBLIC"}
+
+# File context, to triage without opening: test / vendored code
+CTX_TEST = re.compile(r"func Test|\"testing\"|testdata/|\bdescribe\(|\bit\(['\"]|def test_|@Test\b|"
+                      r"unittest|pytest|jest\.|mock|fixture", re.I)
+CTX_VENDOR = re.compile(r"Copyright (?:\(c\) )?\d{4}.{0,80}(?:Authors|Google|Inc\.|Foundation|LLC)", re.S)
+
+
+def context_tag(text):
+    if CTX_TEST.search(text[:200_000]):
+        return "TEST"
+    if CTX_VENDOR.search(text[:1000]):
+        return "VENDOR"
+    return ""
+# Pairing regexes (never tested alone)
+PAIR_RX = {
+    "aws_secret": (("secret",), re.compile(r"(?i)secret[^\n]{0,30}?['\"=:>\s]([A-Za-z0-9/+]{40})(?![A-Za-z0-9/+])")),
+    "g_client": (("googleusercontent",), re.compile(r"\b(\d{6,}-[a-z0-9]{32}\.apps\.googleusercontent\.com)\b")),
+    "g_secret": (("secret",), re.compile(r"(?i)secret[^\n]{0,25}?['\"=:>\s]((?:GOCSPX-[A-Za-z0-9_-]{28})|[A-Za-z0-9_-]{24})(?![A-Za-z0-9_-])")),
+}
+PAIR_CASE_INSENSITIVE = {"aws_secret", "g_secret"}
+NO_ENTROPY = {"jwt", "private_key", "slack_hook", "azure_conn", "azure_sas",
+              "db_uri", "discord_hook"}
+
+HINTS = {
+    "aws_other_id": "IAM identifier (role / user / group), not a secret",
+    "google_api_key": "testing is billable: read the file (google-services.json is public by design)",
+    "stripe_publishable": "public by design",
+    "stripe_webhook": "only verifies webhook signatures, no API",
+    "slack_app": "Socket Mode app token: no whoami without opening a connection",
+    "twilio_sid": "needs SID + auth token; a SID alone is not a secret",
+    "pypi": "no side-effect-free whoami endpoint",
+    "rubygems": "no side-effect-free whoami endpoint",
+    "nuget": "no side-effect-free whoami endpoint",
+    "vault": "needs the Vault server URL: GET /v1/auth/token/lookup-self",
+    "databricks": "needs the host: GET https://<host>/api/2.0/preview/scim/v2/Me",
+    "shopify": "needs the shop domain: GET https://<shop>.myshopify.com/admin/api/2024-01/shop.json",
+    "atlassian": "needs e-mail + site: GET https://<site>.atlassian.net/rest/api/3/myself",
+    "square_secret": "Square OAuth secret, not testable alone",
+    "tailscale": "auth key = machine enrolment; do not test",
+    "braintree": "needs the merchant ID",
+    "cloudflare_global": "global key: needs the account e-mail → GET /client/v4/user (X-Auth-Email + X-Auth-Key)",
+    "cloudflare_origin_ca": "Origin CA key: issues certificates, do not test",
+    "cloudfront_keypair_id": "CloudFront Key-Pair-Id from a signed URL: printed in every signed URL, not a secret",
+}
+
+DET = [(n, needles, re.compile(rx), chk) for n, needles, rx, chk in DETECTORS]
+
+# ================================================================ generic extractor
+GENERIC_KEYS = ("key", "secret", "token", "pass", "pwd", "auth", "cred")
+GENERIC_RX = re.compile(
+    r"""(?i)\b([A-Za-z0-9_.-]{0,30}(?:api[_-]?key|secret|token|passw(?:or)?d|pwd|auth[_-]?key|"""
+    r"""access[_-]?key|private[_-]?key|client[_-]?secret|credentials?)[A-Za-z0-9_.-]{0,20})"""
+    r"""["']?\s*(?:=>|:=|[:=])\s*["']([A-Za-z0-9_\-+/=.:]{16,200})["']""")
+GENERIC_SKIP = re.compile(
+    r"\$\{|\{\{|process\.env|ENV\[|getenv|<%|%>|^https?://|^/|\.(?:js|json|png|svg|css)$"
+    r"|fake|dummy|sample|example|readonly_token|placeholder|changeme|test", re.I)
+# Case-sensitive: CONSTANT_NAME, k8s annotation / ns/name path
+GENERIC_SKIP_CS = re.compile(
+    r"^[A-Z][A-Z0-9_]*$"                         # NOM_DE_CONSTANTE
+    r"|^[a-z0-9.-]+/[a-z0-9./-]+$"               # annotation k8s / ns/nom
+    r"|^urn:|:$"                                 # URN, i18n label "Password:"
+    r"|^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+){2,}$"    # i18n / pref key: a.b.c_error
+    r"|^[a-zA-Z][a-zA-Z0-9]*_[A-Za-z_]+$")       # identifier: ProxyConfig_Changed
+# Known public values (docs / demos)
+KNOWN_PUBLIC = {"zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG", "Q3AM3UQ867SPQQA43P2F",
+                "minioadmin", "SECRET_DO_NOT_PASS_THIS_OR_YOU_WILL_BE_FIRED"}
+EXCLUDE = set()
+HOST_RX = re.compile(r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:"
+                     + "|".join(re.escape(d) for d in DOMAINS) + r"))\b") if DOMAINS else None
+for a in sys.argv[1:]:
+    if a.startswith("--exclude="):
+        EXCLUDE |= {x.strip("/") for x in a.split("=", 1)[1].split(",") if x}
+
+
+# ================================================================ scan
+def scan_file(p):
+    try:
+        if os.path.getsize(p) > MAX_SIZE:
+            return None
+        text = open(p, "rb").read().decode("utf-8", "ignore")
+    except OSError:
+        return None
+    if text.lstrip()[:40].startswith(NOISE_PREFIX):
+        return None
+    low = text.lower()
+    hits = {}
+
+    for name, needles, rx, _ in DET:
+        if needles and not any((n[1:] in low) if n[0] == "~" else (n in text) for n in needles):
+            continue
+        vals = {m.group(1) for m in rx.finditer(text)}
+        vals = {v for v in vals if not PLACEHOLDER.match(v)
+                and (name in NO_ENTROPY or entropy(v) >= MIN_ENTROPY)}
+        if name in VALIDATORS:
+            vals = {v for v in vals if VALIDATORS[name](v)}
+        if name == "private_key":
+            vals = {p for p in map(pem_normalize, vals) if p}
+        if name == "aws_other_id":  # CloudFront Key-Pair-Id is printed in every signed URL
+            kp = {v for v in vals if f"Key-Pair-Id={v}" in text}
+            if kp:
+                hits["cloudfront_keypair_id"] = kp
+                vals -= kp
+        if vals:
+            hits[name] = vals
+    hits.update(composite_hits(text, low))
+
+    for name, (needles, rx) in PAIR_RX.items():
+        hay = low if name in PAIR_CASE_INSENSITIVE else text
+        if any(n in hay for n in needles):
+            vals = {m.group(1) for m in rx.finditer(text) if not PLACEHOLDER.match(m.group(1))}
+            if vals:
+                hits[name] = vals
+
+    generic = []
+    if GENERIC and any(k in low for k in GENERIC_KEYS):
+        for m in GENERIC_RX.finditer(text):
+            k, v = m.group(1), m.group(2)
+            if PLACEHOLDER.match(v) or GENERIC_SKIP.search(v) or GENERIC_SKIP_CS.search(v) or v.isalpha():
+                continue
+            if v in KNOWN_PUBLIC or v.lower() == k.lower().split(".")[-1].lower():
+                continue
+            if not (any(c.isdigit() for c in v) and any(c.isalpha() for c in v)):
+                continue
+            if entropy(v) >= 3.5:
+                generic.append((k, v))
+
+    hosts = set(HOST_RX.findall(low)) if HOST_RX else set()
+    if hits or generic or hosts:
+        return (p, hits, generic, context_tag(text), hosts)
+    return None
+
+
+def scan(root):
+    from concurrent.futures import ProcessPoolExecutor
+    paths = []
+    for dp, dirs, fs in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE]
+        paths += [os.path.join(dp, f) for f in fs]
+    out, n = [], len(paths)
+    with ProcessPoolExecutor() as ex:
+        for i, r in enumerate(ex.map(scan_file, paths, chunksize=64), 1):
+            if r:
+                out.append(r)
+            if i % 500 == 0 or i == n:
+                print(f"\r[scan] {i}/{n} files, {len(out)} with candidates",
+                      end="", file=sys.stderr, flush=True)
+    print(file=sys.stderr)
+    return out
+
+
+def build_jobs(per_file):
+    jobs = {}
+    for p, h, _, ctx, _hosts in per_file:
+        src = (p, ctx)
+        for k in h.get("aws_key_id", ()):
+            for sec in (h.get("aws_secret") or {None}):
+                jobs.setdefault(("aws", k, sec), src)
+        for c in h.get("g_client", ()):
+            for sec in (h.get("g_secret") or {None}):
+                jobs.setdefault(("google_oauth", c, sec), src)
+        for name in [d[0] for d in DETECTORS] + list(COMPOSITE_CHECKS):
+            if name == "aws_key_id":
+                continue
+            for v in h.get(name, ()):
+                key = (name, v, None)
+                if key not in jobs or (jobs[key][1] and not ctx):
+                    jobs[key] = src
+    return jobs
+
+
+CHECKS = {n: c for n, _, _, c in DETECTORS if c is not None}
+CHECKS.update({"aws": chk_aws, "google_oauth": chk_google_oauth, **COMPOSITE_CHECKS})
+PAIRED = {"aws", "google_oauth"}
+FLAG = {"VALID", "KEYID_ACTIVE", "CLIENT_EXISTS", "NOT_EXPIRED", "MAYBE", "REACHABLE",
+        "DEPLOYED", "CERT_TARGET", "CERT_LIVE"}
+# Checks run even with --offline: they classify locally and read OFFLINE before any network call
+LOCAL_ONLY = {"jwt", "private_key", "db_uri", "azure_sas"}
+ORDER = ["DEPLOYED", "CERT_TARGET", "VALID", "MAYBE", "KEYID_ACTIVE", "CLIENT_EXISTS", "NOT_EXPIRED", "REACHABLE", "CERT_LIVE", "UNKNOWN",
+         "ERROR", "MANUAL", "NO_EXP", "UNREACHABLE", "INFO", "PUBLIC", "SKIPPED", "ENCRYPTED",
+         "LOCAL", "FIXTURE", "CERT_EXPIRED", "NO_PUBLIC_CERT", "EXPIRED", "DEAD", "UNPARSEABLE"]
+
+
+def write_generic(per_file):
+    seen = {}
+    for p, _, gen, _ctx, _hosts in per_file:
+        for k, v in gen:
+            if v not in seen:
+                seen[v] = [k, p, 0]
+            seen[v][2] += 1
+    rows = sorted(seen.items(), key=lambda x: -entropy(x[0]))
+    with open("generic_candidates.tsv", "w") as f:
+        f.write("entropie\toccurrences\tnom\tvaleur\tfichier\n")
+        for v, (k, p, n) in rows:
+            f.write(f"{entropy(v):.2f}\t{n}\t{k}\t{v}\t{p}\n")
+    return len(rows)
+
+
+# ================================================================ private-key triage
+# Automates the manual steps: full SPKI fingerprint, comparison with the key
+# actually served by target hosts, and crt.sh lookup. Keys are never used:
+# only their PUBLIC half is compared to public data.
+CRTSH_CACHE = os.path.expanduser("~/.cache/check-leaks/crtsh.json")
+CRTSH_TTL = 7 * 86400
+
+
+def spki_of_private(pem):
+    from cryptography.hazmat.primitives import serialization as s
+    k = s.load_ssh_private_key(pem.encode(), None) if "OPENSSH" in pem \
+        else s.load_pem_private_key(pem.encode(), None)
+    return hashlib.sha256(k.public_key().public_bytes(
+        s.Encoding.DER, s.PublicFormat.SubjectPublicKeyInfo)).hexdigest()
+
+
+def live_spki(target):
+    """SPKI sha256 of the leaf certificate served by host[:port], or None if unreachable."""
+    import ssl
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization as s
+    host, _, port = target.partition(":")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE  # we only read the cert
+    try:
+        with socket.create_connection((host, int(port or 443)), timeout=6) as raw, \
+                ctx.wrap_socket(raw, server_hostname=host) as tls:
+            der = tls.getpeercert(binary_form=True)
+    except (OSError, ValueError):
+        return None
+    if not der:
+        return None
+    pub = x509.load_der_x509_certificate(der).public_key()
+    return hashlib.sha256(pub.public_bytes(s.Encoding.DER, s.PublicFormat.SubjectPublicKeyInfo)).hexdigest()
+
+
+def _load_cache():
+    try:
+        with open(CRTSH_CACHE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_cache(cache):
+    try:
+        os.makedirs(os.path.dirname(CRTSH_CACHE), exist_ok=True)
+        with open(CRTSH_CACHE, "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
+def crtsh_lookup(fp, cache):
+    """Certificates issued for this SPKI (list of dicts) or None if crt.sh never answered."""
+    import requests
+    hit = cache.get(fp)
+    if hit and time.time() - hit["t"] < CRTSH_TTL:
+        return hit["certs"]
+    for attempt in range(4):
+        try:
+            r = requests.get(f"https://crt.sh/?spkisha256={fp}&output=json", timeout=60)
+            if r.status_code == 200:
+                certs = [{k: c.get(k) for k in ("id", "issuer_name", "common_name", "name_value",
+                                                "not_before", "not_after")} for c in r.json()]
+                cache[fp] = {"t": time.time(), "certs": certs}
+                return certs
+        except Exception:
+            pass
+        time.sleep(10 * (attempt + 1))
+    return None
+
+
+def _is_target(name):
+    name = name.lower().lstrip("*.")
+    return any(name == d or name.endswith("." + d) for d in DOMAINS)
+
+
+def pk_triage(results, hosts):
+    keys = [r for r in results if r["type"] == "private_key" and r["state"] == "MANUAL"]
+    if not keys:
+        return
+    for r in keys:
+        try:
+            r["spki"] = spki_of_private(r["value"])
+        except Exception:
+            r["spki"] = None
+
+    # 1) is the key served right now by one of the target hosts?
+    if hosts:
+        from concurrent.futures import ThreadPoolExecutor
+        print(f"[pk] fetching live TLS keys of {len(hosts)} hosts…", file=sys.stderr)
+        with ThreadPoolExecutor(20) as ex:
+            live = dict(zip(hosts, ex.map(live_spki, hosts)))
+        served = {}
+        for h, fp in live.items():
+            if fp:
+                served.setdefault(fp, []).append(h)
+        n_ok = sum(1 for v in live.values() if v)
+        print(f"[pk] {n_ok}/{len(hosts)} hosts answered TLS", file=sys.stderr)
+        for r in keys:
+            if r["spki"] in served:
+                r["state"] = "DEPLOYED"
+                r["info"] = f"spki={r['spki'][:16]} SERVED NOW by {', '.join(served[r['spki']][:3])} — stop, report, do not use the key"
+
+    # 2) has a public certificate ever been issued for this key?
+    if not CRTSH:
+        return
+    todo = [r for r in keys if r["state"] == "MANUAL" and r["spki"] and (PK_ALL or not r["ctx"])]
+    if not todo:
+        return
+    cache = _load_cache()
+    print(f"[pk] crt.sh lookup for {len(todo)} keys (cache: {CRTSH_CACHE})", file=sys.stderr)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    for i, r in enumerate(todo, 1):
+        cached = r["spki"] in cache
+        certs = crtsh_lookup(r["spki"], cache)
+        print(f"\r[pk] {i}/{len(todo)}", end="", file=sys.stderr, flush=True)
+        if not cached:
+            _save_cache(cache)
+            time.sleep(2)
+        if certs is None:
+            r["info"] += " | crt.sh: no answer, rerun later (cached results are kept)"
+            continue
+        if not certs:
+            r["state"], r["info"] = "NO_PUBLIC_CERT", r["info"].split(" → ")[0] + " — never used for a public certificate"
+            continue
+        names = sorted({n for c in certs for n in (c.get("name_value") or "").split("\n") if n})
+        valid = [c for c in certs if (c.get("not_after") or "") > now]
+        target = [n for n in names if _is_target(n)]
+        summary = f"{len(certs)} certs ({len(valid)} valid) names={names[:3]} issuer={certs[0].get('issuer_name', '')[:60]}"
+        if target and valid:
+            r["state"], r["info"] = "CERT_TARGET", f"spki={r['spki'][:16]} VALID certificate for target domain {target[:3]} — {summary}"
+        elif valid:
+            r["state"], r["info"] = "CERT_LIVE", f"spki={r['spki'][:16]} valid cert, not on target domains (third party?) — {summary}"
+        else:
+            r["state"], r["info"] = "CERT_EXPIRED", f"spki={r['spki'][:16]} only expired certs — {summary}"
+    print(file=sys.stderr)
+    _save_cache(cache)
+
+
+def main():
+    per_file = scan(ROOT)
+    jobs = build_jobs(per_file)
+    print(f"[*] {len(per_file)} files with candidates, {len(jobs)} unique tests\n")
+
+    results = []
+    for (kind, val, sec), (path, ctx) in jobs.items():
+        chk = CHECKS[kind]
+        if isinstance(chk, str):
+            state, info = chk, HINTS.get(kind, "")
+        elif OFFLINE and kind not in LOCAL_ONLY:
+            state, info = "SKIPPED", "--offline"
+        else:
+            try:
+                state, info = chk(val, sec) if kind in PAIRED else chk(val)
+            except Exception as e:
+                state, info = "ERROR", repr(e)[:80]
+            if kind not in ("jwt", "private_key"):
+                time.sleep(0.3)
+        results.append({"type": kind, "value": val, "secret": sec,
+                        "state": state, "info": info, "file": path, "ctx": ctx})
+
+    # one key (PKCS#1, PKCS#8, pasted in code…) = one line
+    by_fp, kept = {}, []
+    for r in results:
+        m = re.match(r"spki_sha256=(\w+)", r["info"]) if r["type"] == "private_key" else None
+        if not m:
+            kept.append(r)
+            continue
+        prev = by_fp.get(m.group(1))
+        if prev is None:
+            r["dups"] = 1
+            by_fp[m.group(1)] = r
+            kept.append(r)
+        else:
+            prev["dups"] += 1
+            if prev["ctx"] and not r["ctx"]:
+                prev.update(file=r["file"], ctx="")
+    for r in by_fp.values():
+        if r["dups"] > 1:
+            r["info"] += f" (×{r['dups']} formats/files)"
+    results = kept
+
+    if not OFFLINE:
+        hosts = list(HOSTS)
+        if DOMAINS:
+            found = sorted({h for item in per_file for h in item[4]})
+            hosts += [h for h in found if h not in hosts][:300]
+            print(f"[pk] {len(found)} hostnames under {DOMAINS} collected from the dump", file=sys.stderr)
+        pk_triage(results, hosts)
+
+    rank = {s: i for i, s in enumerate(ORDER)}
+    # for equal state, test / vendored files go last
+    results.sort(key=lambda r: (rank.get(r["state"], 99), r["ctx"] != "", r["type"]))
+    for r in results:
+        flag = "🔥" if r["state"] in FLAG else "  "
+        print(f"{flag} {r['state']:14} {r['type']:18} {r['ctx']:6} {mask(r['value'], r['type']):38} "
+              f"{mask(r['secret'] or ''):20} {r['info']}")
+
+    with open("leaks_checked.json", "w") as f:
+        json.dump(results, f, indent=2)
+    summary = Counter(r["state"] for r in results)
+    print("\n[*] " + "  ".join(f"{s}={summary[s]}" for s in ORDER if summary[s]))
+    print("[*] Details: leaks_checked.json")
+    if GENERIC:
+        n = write_generic(per_file)
+        print(f"[*] {n} generic values to review: generic_candidates.tsv "
+              f"(column -t -s$'\\t' generic_candidates.tsv | less -S)")
+
+
+if __name__ == "__main__":
+    main()
